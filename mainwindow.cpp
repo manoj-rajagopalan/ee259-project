@@ -295,7 +295,7 @@ MainWindow::~MainWindow()
 {
 using namespace Assimp;
 
-	DefaultLogger::get()->detatchStream(mLoggerView, DefaultLogger::Debugging | DefaultLogger::Info | DefaultLogger::Err | DefaultLogger::Warn);
+	DefaultLogger::get()->detachStream(mLoggerView, DefaultLogger::Debugging | DefaultLogger::Info | DefaultLogger::Err | DefaultLogger::Warn);
 	DefaultLogger::kill();
 
 	if(mScene != nullptr) mImporter.FreeScene();

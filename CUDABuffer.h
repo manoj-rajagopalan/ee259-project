@@ -37,19 +37,23 @@ namespace osc {
     inline CUdeviceptr d_pointer() const
     { return (CUdeviceptr)d_ptr; }
 
+    inline CUdeviceptr& d_pointer_ref() {
+      return *((CUdeviceptr*) d_ptr);
+    }
+
     //! re-size buffer to given number of bytes
-    void resize(size_t size)
+    void resize(size_t sizeInBytes, cudaStream_t cudaStream = 0)
     {
       if (d_ptr) free();
-      alloc(size);
+      alloc(sizeInBytes, cudaStream);
     }
     
     //! allocate to given number of bytes
-    void alloc(size_t size)
+    void alloc(size_t sizeInBytes, cudaStream_t cudaStream = 0)
     {
       assert(d_ptr == nullptr);
-      this->sizeInBytes = size;
-      CUDA_CHECK(Malloc( (void**)&d_ptr, sizeInBytes));
+      this->sizeInBytes = sizeInBytes;
+      CUDA_CHECK( MallocAsync( (void**)&d_ptr, sizeInBytes, cudaStream) );
     }
 
     //! free allocated memory
@@ -60,31 +64,51 @@ namespace osc {
       sizeInBytes = 0;
     }
 
-    template<typename T>
-    void alloc_and_upload(const std::vector<T> &vt)
+    void yield() // ownership to another resource
     {
-      alloc(vt.size()*sizeof(T));
-      upload((const T*)vt.data(),vt.size());
+      d_ptr = nullptr;
+    }
+
+    template<typename T>
+    void alloc_and_upload(const std::vector<T> &vt, cudaStream_t cudaStream = 0)
+    {
+      alloc(vt.size()*sizeof(T), cudaStream);
+      upload((const T*)vt.data(), vt.size(), cudaStream);
     }
     
     template<typename T>
-    void upload(const T *t, size_t count)
+    void alloc_and_upload(T const *t, size_t count, cudaStream_t cudaStream = 0)
+    {
+      alloc(count*sizeof(T), cudaStream);
+      upload(t, count, cudaStream);
+    }
+
+    template<typename T>
+    void upload(const T *t, size_t count, cudaStream_t cudaStream = 0)
     {
       assert(d_ptr != nullptr);
       assert(sizeInBytes == count*sizeof(T));
-      CUDA_CHECK(Memcpy(d_ptr, (void *)t,
-                        count*sizeof(T), cudaMemcpyHostToDevice));
+      this->numElements = count;
+      CUDA_CHECK (MemcpyAsync(d_ptr, (void *)t,
+                              count*sizeof(T),
+                              cudaMemcpyHostToDevice,
+                              cudaStream) );
     }
     
     template<typename T>
-    void download(T *t, size_t count)
+    void download(T *t, size_t count, cudaStream_t cudaStream = 0)
     {
       assert(d_ptr != nullptr);
       assert(sizeInBytes == count*sizeof(T));
-      CUDA_CHECK(Memcpy((void *)t, d_ptr,
-                        count*sizeof(T), cudaMemcpyDeviceToHost));
+      assert(numElements == count);
+      CUDA_CHECK( MemcpyAsync((void *)t,
+                              d_ptr,
+                              count*sizeof(T),
+                              cudaMemcpyDeviceToHost,
+                              cudaStream));
     }
     
+    size_t numElements{0};
     size_t sizeInBytes { 0 };
     void  *d_ptr { nullptr };
   };

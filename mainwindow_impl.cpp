@@ -1,18 +1,25 @@
 #include "mainwindow_impl.hpp"
 #include "cuda_optix_sentinel.h"
 
+// https://forums.developer.nvidia.com/t/linking-optix7-with-gcc/107036
+#include <optix_function_table_definition.h>
+
+#include <array>
 #include <cassert>
 #include <fstream>
 #include <iterator>
 
-#include "mainwindow.hpp"
+#include "CUDABuffer.h"
+#include "LaunchParams.hpp"
 
-namespace {
+#include "mainwindow.hpp"
 
 std::unique_ptr<MainWindow> makeMainWindow()
 {
 	return std::make_unique<MainWindow_Impl>();
 }
+
+namespace {
 
 MainWindow_Impl *g_theMainWindow = nullptr; // to route OptiX error messages to
 
@@ -22,16 +29,35 @@ struct ExecutionLogger
     explicit ExecutionLogger(std::string&& theScope)
     : scope(std::move(theScope))
     {
-        g_theMainWindow->LogInfo(theScope + ": begin");
+        g_theMainWindow->LogInfo((scope + ": begin").c_str());
     }
 
     ~ExecutionLogger()
     {
-        g_theMainWindow->LogInfo(theScope + ": end");
+        g_theMainWindow->LogInfo((scope + ": end").c_str());
     }
 
     std::string scope;
 };
+
+// CPU-side Factory method
+manojr::OptixLaunchParams makeOptixLaunchParams(int numThreads_x,
+                                                int numThreads_y,
+                                                OptixTraversableHandle gas_handle)
+{
+    manojr::OptixLaunchParams p;
+    assert(numThreads_x > 0);
+    assert(numThreads_y > 0);
+    osc::CUDABuffer resultBufferOnGpu;
+    resultBufferOnGpu.resize(numThreads_x * numThreads_y * 3*sizeof(float));
+    p.pointCloud = (float*) resultBufferOnGpu.d_pointer();
+    p.numThreads_x = numThreads_x;
+    p.numThreads_y = numThreads_y;
+    p.atomicNumPoints = 0;
+    p.gas_handle = gas_handle;
+    // TODO - set p.rayEmitter values
+    return p;
+}
 
 } // namespace
 
@@ -39,6 +65,30 @@ MainWindow_Impl::MainWindow_Impl(QWidget *parent)
 : MainWindow(parent)
 {
 	g_theMainWindow = this; // route all OptiX messages
+}
+
+void MainWindow_Impl::initializeCuda_()
+{
+    int cudaDeviceCount = 0;
+    CUDA_CHECK( GetDeviceCount(&cudaDeviceCount) );
+    this->LogInfo(("Found " + std::to_string(cudaDeviceCount) + " CUDA device").c_str());
+    assert(cudaDeviceCount == 1);
+
+    int cudaDevice = -1;
+    CUDA_CHECK( GetDevice(&cudaDevice) );
+    cudaDeviceProp cudaDeviceProps;
+    CUDA_CHECK( GetDeviceProperties(&cudaDeviceProps, cudaDevice) );
+    this->LogInfo((std::string("CUDA device name is ") + cudaDeviceProps.name).c_str());
+
+    CUDA_CHECK( SetDevice(cudaDevice) );
+
+    CUDA_CHECK( StreamCreate(&cudaStream_) );
+
+}
+
+void MainWindow_Impl::finalizeCuda_()
+{
+    CUDA_CHECK( StreamDestroy(cudaStream_) );
 }
 
 /********************************************************************/
@@ -74,9 +124,7 @@ void MainWindow_Impl::createOptixDeviceContext_(const std::string& indent)
 }
 
 
-void MainWindow_Impl::extractGeometry(std::vector<std::array<float,3>>& vertexBuffer,
-                                  std::vector<std::array<uint16_t,3>>& indexBuffer,
-                                  const std::string& indent)
+void MainWindow_Impl::extractGeometry_(const std::string& indent)
 {
      ExecutionLogger execLog(indent + __func__);
 
@@ -84,6 +132,9 @@ void MainWindow_Impl::extractGeometry(std::vector<std::array<float,3>>& vertexBu
 		this->LogError(tr("Scene has no meshes!"));
         return;
 	}
+
+    std::vector<std::array<float,3>> vertexBuffer;
+    std::vector<std::array<uint16_t,3>> indexBuffer;
 
     assert(mScene->mNumMeshes > 0);
     aiMesh const* mesh = mScene->mMeshes[0];
@@ -95,6 +146,8 @@ void MainWindow_Impl::extractGeometry(std::vector<std::array<float,3>>& vertexBu
         vertexBuffer[i][1] = vertex[1];
         vertexBuffer[i][2] = vertex[2];
     }
+    vertexBufferOnGpu_.alloc_and_upload(vertexBuffer);
+
     indexBuffer.clear();
     indexBuffer.resize(mesh->mNumFaces);
     for(uint32_t i = 0; i < mesh->mNumFaces; ++i) {
@@ -107,22 +160,23 @@ void MainWindow_Impl::extractGeometry(std::vector<std::array<float,3>>& vertexBu
         assert(face.mIndices[2] < (1u << 16));
         indexBuffer[i][2] = (uint16_t) face.mIndices[2];
     }
+    indexBufferOnGpu_.alloc_and_upload(indexBuffer);
 }
 
-CUdevicePtr copyToDevice(const void *buffer, size_t size)
+CUdeviceptr copyToCuDevice(const void *buffer, size_t size)
 {
-    CUdevicePtr bufferDevicePtr;
-	CUDA_CHECK( Malloc(&bufferDevicePtr, size) );
-	CUDA_CHECK( Memcpy(bufferDevicePtr, buffer, size, cudaMemcpyHostToDevice) );
+    CUdeviceptr bufferDevicePtr;
+	CUDA_CHECK( Malloc((void**) &bufferDevicePtr, size) );
+	CUDA_CHECK( Memcpy((void*) bufferDevicePtr, buffer, size, cudaMemcpyHostToDevice) );
 	return bufferDevicePtr;
 }
 
 template<typename T>
 inline
-CUdevicePtr copyToDevice(const std::vector<T>& v)
+CUdeviceptr copyToCuDevice(const std::vector<T>& v)
 {
 	size_t const memSize = v.size() * sizeof(T);
-    return copyToDevice((const void*) v.data(), memSize);
+    return copyToCuDevice((const void*) v.data(), memSize);
 }
 
 OptixTraversableHandle MainWindow_Impl::buildOptixAccelerationStructures_(const std::string& indent)
@@ -132,38 +186,36 @@ OptixTraversableHandle MainWindow_Impl::buildOptixAccelerationStructures_(const 
     ExecutionLogger execLog(indent + __func__);
 
 	// https://raytracing-docs.nvidia.com/optix7/api/struct_optix_accel_build_options.html
-	OptixAccessBuildOptions optixAccessBuildOptions = {};
+	OptixAccelBuildOptions optixAccelBuildOptions = {};
 	{
 		// https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#ggaff328b8278fbd1900558593599698bbaafa820662dca4a85935ab74c704665d93
-		optixAccessBuildOptions.buildFlags = OPTIX_BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS;
+		optixAccelBuildOptions.buildFlags = OPTIX_BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS;
 
 		// https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#ga411c1c6d9f4d8e039ae19e9dea65958a
-		optixAccessBuildOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
+		optixAccelBuildOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
 
 		// Ignore optixAccessBuildOptions.motionOptions
 	}
 
 	// https://raytracing-docs.nvidia.com/optix7/api/struct_optix_build_input.html
-	OptixAccelBuildInput optixAccessBuildInput = {};
+	OptixBuildInput optixBuildInput = {};
 	{
 		// https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#ga7932d1d9cdf33506a75a5da5d8a62d94
-		optixAccessBuildInput.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+		optixBuildInput.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
 
 		// https://raytracing-docs.nvidia.com/optix7/api/struct_optix_build_input_triangle_array.html
-		std::vector<std::array<float,3>> vertexBuffer;
-		std::vector<std::array<uint16_t,3>> indexBuffer;
-		extractGeometry_(vertexBuffer, indexBuffer, "..");
+		extractGeometry_("..");
 
-        OptixAccelBuildInputTriangleArray& triangleArray = optixAccelBuildInput.triangleArray;
-		triangleArray.vertexBuffers = copyToCuDevice(vertexBuffer);
-		triangleArray.numVertices = (unsigned int) vertexBuffer.size();
+        OptixBuildInputTriangleArray& triangleArray = optixBuildInput.triangleArray;
+		triangleArray.vertexBuffers = &(vertexBufferOnGpu_.d_pointer_ref());
+		triangleArray.numVertices = (unsigned int) vertexBufferOnGpu_.numElements;
 		// https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#ga55c6d96161ef202d48023a8a1d126102
 		triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
 
-		triangleArray.indexBuffer = copyToCuDevice(indexBuffer);
-		triangleArray.numIndexTriplets = (unsigned int) indexBuffer.size();
+		triangleArray.indexBuffer = indexBufferOnGpu_.d_pointer();
+		triangleArray.numIndexTriplets = (unsigned int) indexBufferOnGpu_.numElements;
 		https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#gaa98b8fb6bf2d2455c310125f3fab74e6
-		triangleArray.inputFormat = OPTIX_INDICES_FORMAT_UNSIGNED_SHORT3;
+		triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_SHORT3;
 		triangleArray.indexStrideInBytes = 0; // tightly packed
 
         const unsigned int triangle_flags[]{OPTIX_GEOMETRY_FLAG_NONE};
@@ -177,32 +229,27 @@ OptixTraversableHandle MainWindow_Impl::buildOptixAccelerationStructures_(const 
 		optixAccelComputeMemoryUsage(optixDeviceContext_,
 		                             &optixAccelBuildOptions,
 									 &optixBuildInput, 1,
-									 &optixAccessBufferSizes)
+									 &optixAccelBufferSizes)
 	);
     assert(optixAccelBufferSizes.tempUpdateSizeInBytes == 0);
 
     // Allocate buffers for the build
-    gasBuildDevicePtr_ = nullptr;
-    CUDA_CHECK( Malloc(&gasBuildDevicePtr_, optixAccessBufferSizes.outputSizeInBytes) );
+    gasBuild_.resize(optixAccelBufferSizes.outputSizeInBytes);
 
-    CUdevicePtr d_buildTemp = nullptr;
-    CUDA_CHECK( Malloc(&d_buildTemp, optixAccessBufferSizes.tempSizeInBytes) );
+    osc::CUDABuffer gasBuildTemp;
+    gasBuildTemp.resize(optixAccelBufferSizes.tempSizeInBytes);
 
     OPTIX_CHECK(
         optixAccelBuild(optixDeviceContext_,
-                        0, // cuStream (current)
+                        cudaStream_,
                         &optixAccelBuildOptions,
-                        &optixAccelBuildInput, 1,
-                        d_buildTemp,
-                        optixAccelBufferSizes.tempSizeInBytes,
-                        gasBuildDevicePtr_,
-                        optixAccelBufferSizes.outputSizeInBytes,
+                        &optixBuildInput, 1,
+                        gasBuildTemp.d_pointer(), gasBuildTemp.sizeInBytes,
+                        gasBuild_.d_pointer(), gasBuild_.sizeInBytes,
                         &gasHandle,
                         nullptr, 0 // emitted properties
                         );
     );
-
-    CUDA_CHECK( Free((void*) d_buildTemp) );
 
     return gasHandle;
 }
@@ -212,8 +259,9 @@ std::string MainWindow_Impl::loadOptixModuleSourceCode_(const std::string& inden
     ExecutionLogger execLog(indent + __func__);
     std::ifstream sourceCodeFile("ee259.cu");
     // https://stackoverflow.com/a/2912614
-    std::string sourceCode(std::istreambuf_iterator<char>(sourceCodeFile),
-                           std::istreambuf_iterator<char>());
+    std::istreambuf_iterator<char> sourceCodeFileIter{sourceCodeFile};
+    std::string sourceCode(sourceCodeFileIter,
+                           std::istreambuf_iterator<char>{});
     return sourceCode;
 }
 
@@ -225,8 +273,8 @@ void MainWindow_Impl::makeOptixModule_(OptixPipelineCompileOptions optixPipeline
     ExecutionLogger execLog(indent + __func__);
 
     // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_module_compile_options.html
-    OptixModuleCompileOptions optixModuleCompileΟptions{};
-    optixModuleCompileOptions.maxxRegisterCount = 0; // unlimited
+    OptixModuleCompileOptions optixModuleCompileOptions{};
+    optixModuleCompileOptions.maxRegisterCount = 0; // unlimited
     // https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#gaea8ecab8ad903804364ea246eefc79b2
     optixModuleCompileOptions.optLevel = OPTIX_COMPILE_OPTIMIZATION_LEVEL_0; // none, for debug
     // https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#ga2a921efc5016b2b567fa81ddb429e81a
@@ -264,8 +312,8 @@ OptixPipelineCompileOptions MainWindow_Impl::makeOptixPipelineCompileOptions_()
                                                  OPTIX_EXCEPTION_FLAG_DEBUG;
     optixPipelineCompileOptions.pipelineLaunchParamsVariableName = 0; // TODO
     // https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#ga1171b332da08991dd9e6ef54b52b3ba4
-    optixPipelineCompileFlags.usesPrimitiveTypeFlags = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
-    optixPipelineCompileFlags.allowOpacityMicromaps = 0;
+    optixPipelineCompileOptions.usesPrimitiveTypeFlags = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
+    optixPipelineCompileOptions.allowOpacityMicromaps = 0;
     return optixPipelineCompileOptions;
 }
 
@@ -277,23 +325,23 @@ OptixPipelineLinkOptions MainWindow_Impl::makeOptixPipelineLinkOptions_()
     return optixPipelineLinkOptions;
 }
 
-OptixProgramGroupDesc MainWindow_Impl::makeRayGenProgramGroupDescription_()
+OptixProgramGroupDesc MainWindow_Impl::makeRaygenProgramGroupDescription_()
 {
     // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_program_group_desc.html
     OptixProgramGroupDesc raygenProgramGroupDescription;
     // https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#gabca35b1218b4df575a5c42926da0d978
-    raygenProgramGroupDescription.kind = OPTIX_PROGRAM_GROUP_RAYGEN;
+    raygenProgramGroupDescription.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
     // https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#gaa65e764f5bba97fda45d4453c0464596
     raygenProgramGroupDescription.flags = OPTIX_PROGRAM_GROUP_FLAGS_NONE;
 
     // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_program_group_single_module.html
-    raygenProgramGroupDescription.module = optixModule_;
-    raygenProgramGroupDescription.entryFunctionName = "__raygen__rg";
+    raygenProgramGroupDescription.raygen.module = optixModule_;
+    raygenProgramGroupDescription.raygen.entryFunctionName = "__raygen__rg";
 
     return raygenProgramGroupDescription;
 }
 
-void MainWindow_Impl::makeRayGenProgramGroup_(char* optixLogBuffer,
+void MainWindow_Impl::makeRaygenProgramGroup_(char* optixLogBuffer,
                                               size_t optixLogBufferSize,
                                               const std::string& indent)
 {
@@ -301,7 +349,7 @@ void MainWindow_Impl::makeRayGenProgramGroup_(char* optixLogBuffer,
 
     ExecutionLogger execLog(indent + __func__);
 
-    OptixProgramGroupDesc raygenProgramGroupDesc = makeRayGenProgramGroupDescription_();
+    OptixProgramGroupDesc raygenProgramGroupDesc = makeRaygenProgramGroupDescription_();
     OptixProgramGroupOptions *raygenProgramGroupOptions = nullptr; // no payload
 
     // https://raytracing-docs.nvidia.com/optix7/api/optix__host_8h.html#aa3515445a876a8a381ced002e4020d42
@@ -313,7 +361,7 @@ void MainWindow_Impl::makeRayGenProgramGroup_(char* optixLogBuffer,
                                 &raygenProgramGroup_)
     );
     optixLogBuffer[optixLogBufferSize] = '\0';
-    this->LogInfo(QString(optixLogBuffer))
+    this->LogInfo(QString(optixLogBuffer));
 }
 
 OptixProgramGroupDesc MainWindow_Impl::makeHitGroupProgramGroupDescription_()
@@ -321,13 +369,13 @@ OptixProgramGroupDesc MainWindow_Impl::makeHitGroupProgramGroupDescription_()
     // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_program_group_desc.html
     OptixProgramGroupDesc hitGroupProgramGroupDescription;
     // https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#gabca35b1218b4df575a5c42926da0d978
-    hitGroupProgramGroupDescription.kind = OPTIX_PROGRAM_GROUP_HITGROUP;
+    hitGroupProgramGroupDescription.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
     // https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#gaa65e764f5bba97fda45d4453c0464596
     hitGroupProgramGroupDescription.flags = OPTIX_PROGRAM_GROUP_FLAGS_NONE;
 
-    // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_program_group_single_module.html
-    hitGroupProgramGroupDescription.module = optixModule_;
-    hitGroupProgramGroupDescription.entryFunctionName = "__closest_hit__ch";
+    // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_program_group_hitgroup.html
+    hitGroupProgramGroupDescription.hitgroup.moduleCH = optixModule_;
+    hitGroupProgramGroupDescription.hitgroup.entryFunctionNameCH = "__closesthit__xpoint";
 
     return hitGroupProgramGroupDescription;
 }
@@ -353,6 +401,22 @@ void MainWindow_Impl::makeHitGroupProgramGroup_(char *optixLogBuffer,
     );
     optixLogBuffer[optixLogBufferSize] = '\0';
     this->LogInfo(QString(optixLogBuffer));
+}
+
+OptixProgramGroupDesc MainWindow_Impl::makeMissProgramGroupDescription_()
+{
+    // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_program_group_desc.html
+    OptixProgramGroupDesc missProgramGroupDescription;
+    // https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#gabca35b1218b4df575a5c42926da0d978
+    missProgramGroupDescription.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
+    // https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#gaa65e764f5bba97fda45d4453c0464596
+    missProgramGroupDescription.flags = OPTIX_PROGRAM_GROUP_FLAGS_NONE;
+
+    // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_program_group_single_module.html
+    missProgramGroupDescription.miss.module = optixModule_;
+    missProgramGroupDescription.miss.entryFunctionName = "__miss__noop";
+
+    return missProgramGroupDescription;
 }
 
 void MainWindow_Impl::makeMissProgramGroup_(char *optixLogBuffer,
@@ -394,12 +458,12 @@ void MainWindow_Impl::buildOptixPipeline_(const std::string& indent)
                      indent+"..");
     OptixPipelineLinkOptions optixPipelineLinkOptions =
         makeOptixPipelineLinkOptions_();
-    makeRayGenProgramGroup_(optixLogBuffer, kOptixLogBufferSize-1, indent+"..");
+    makeRaygenProgramGroup_(optixLogBuffer, kOptixLogBufferSize-1, indent+"..");
     makeHitGroupProgramGroup_(optixLogBuffer, kOptixLogBufferSize-1, indent+"..");
-    makeMissGroupProgramGroup_(optixLogBuffer, kOptixLogBufferSize-1, indent+"..");
+    makeMissProgramGroup_(optixLogBuffer, kOptixLogBufferSize-1, indent+"..");
 
-    const unsigned int kNumProgramGroups = 3
-    OptixProgramGroup optixProgramGroups[kNumProgramGroups] {
+    constexpr unsigned int kNumProgramGroups = 3;
+    std::array<OptixProgramGroup, kNumProgramGroups> optixProgramGroups{
         raygenProgramGroup_, hitGroupProgramGroup_, missProgramGroup_
     };
     
@@ -408,7 +472,7 @@ void MainWindow_Impl::buildOptixPipeline_(const std::string& indent)
         optixPipelineCreate(optixDeviceContext_,
                             &optixPipelineCompileOptions,
                             &optixPipelineLinkOptions,
-                            optixProgramGroups, kNumProgramGroups,
+                            optixProgramGroups.data(), kNumProgramGroups,
                             optixLogBuffer, &optixLogBufferSize,
                             &optixPipeline_);
     );
@@ -425,7 +489,7 @@ struct ShaderBindingTableRecord
 };
 
 struct RayGenData { /* TODO */};
-using RayGenSbtRecord = ShaderBindingTableRecord<RayGenData>
+using RayGenSbtRecord = ShaderBindingTableRecord<RayGenData>;
 
 struct MissData { /* TODO */ };
 using MissSbtRecord = ShaderBindingTableRecord<MissData>;
@@ -433,76 +497,62 @@ using MissSbtRecord = ShaderBindingTableRecord<MissData>;
 struct HitGroupData { /* TODO */ };
 using HitGroupSbtRecord = ShaderBindingTableRecord<HitGroupData>;
 
-CUdevicePtr MainWindow_Impl::makeRayGenSbtRecord_(const std::string& indent)
+CUdeviceptr MainWindow_Impl::makeRaygenSbtRecord_(const std::string& indent)
 {
-    CUdevicePtr rayGenSbtRecordDevicePtr; // return value
-
     ExecutionLogger execLog(indent + __func__);
-    RayGenSbtRecord rayGenSbtRecord;    
+    RayGenSbtRecord raygenSbtRecord;    
     OPTIX_CHECK(
-        optixSbtRecordPackHeader(rayGenProgramGroup_, (void*) &rayGenSbtRecord)
+        optixSbtRecordPackHeader(raygenProgramGroup_, (void*) &raygenSbtRecord)
     );
-
-    // Populate rayGenSbtRecord.data here if needed in future
-
-    // Transfer to device
-    rayGenSbtRecordDevicePtr = copyToDevice((const void*) &rayGenSbtRecord, sizeof(rayGenSbtRecord));
-    return rayGenSbtRecordDevicePtr;
+    // Populate raygenSbtRecord.data here if needed in future
+    osc::CUDABuffer raygenSbtRecordOnGpu;
+    raygenSbtRecordOnGpu.upload(&raygenSbtRecord, 1);
+    return raygenSbtRecordOnGpu.d_pointer();
 }
 
-std::pair<CUdevicePtr, unsigned int>
+std::pair<CUdeviceptr, unsigned int>
 MainWindow_Impl::makeMissSbtRecord_(const std::string& indent)
 {
-    // Return values
-    CUdevicePtr missSbtRecordDevicePtr = 0;
-    unsigned int missSbtRecordSizeInBytes = 0;
-
     ExecutionLogger execLog(indent + __func__);
-
     MissSbtRecord missSbtRecord;
     OPTIX_CHECK(
-        optixSbtRecordPackHeader(missProgramGroup_, (void*) missSbtRecord)
+        optixSbtRecordPackHeader(missProgramGroup_, (void*) &missSbtRecord)
     );
-    missSbtRecordSizeInBytes = sizeof(missSbtRecord);
-    missSbtRecordDevicePtr = copyToDevice((void*), &missSbtRecord, missSbtRecordSizeInBytes);
-
-    return std::make_pair(missSbtRecordDevicePtr, missSbtRecordSizeInBytes);
+    osc::CUDABuffer missSbtRecordOnGpu;
+    missSbtRecordOnGpu.upload(&missSbtRecord, 1);
+    return std::make_pair(missSbtRecordOnGpu.d_pointer(),
+                          missSbtRecordOnGpu.sizeInBytes);
 }
 
-std::pair<CUdevicePtr, unsigned int>
+std::pair<CUdeviceptr, unsigned int>
 MainWindow_Impl::makeHitGroupSbtRecord_(const std::string& indent)
 {
-    // Return values
-    CUdevicePtr hitGroupSbtRecordDevicePtr = 0;
-    unsigned int hitGroupSbtRecordSizeInBytes = 0;
-
     ExecutionLogger execLog(indent + __func__);
-
     MissSbtRecord hitGroupSbtRecord;
     OPTIX_CHECK(
-        optixSbtRecordPackHeader(hitGroupProgramGroup_, (void*) hitGroupSbtRecord)
+        optixSbtRecordPackHeader(hitGroupProgramGroup_, (void*) &hitGroupSbtRecord)
     );
-    hitGroupSbtRecordSizeInBytes = sizeof(hitGroupSbtRecord);
-    hitGroupSbtRecordDevicePtr = copyToDevice((void*), &hitGroupSbtRecord, hitGroupSbtRecordSizeInBytes);
-
-    return std::make_pair(hitGroupSbtRecordDevicePtr, hitGroupSbtRecordSizeInBytes);
+    osc::CUDABuffer hitGroupSbtRecordOnGpu;
+    hitGroupSbtRecordOnGpu.upload(&hitGroupSbtRecord, 1);
+    return std::make_pair(hitGroupSbtRecordOnGpu.d_pointer(),
+                          hitGroupSbtRecordOnGpu.sizeInBytes);
 }
 
 OptixShaderBindingTable MainWindow_Impl::makeOptixShaderBindingTable_(const std::string& indent)
 {
+    ExecutionLogger execLog(indent + __func__);
+
     // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_shader_binding_table.html
     OptixShaderBindingTable sbt; // return value
 
-    ExecutionLogger execLog(indent + __func__);
-
-    sbt.raygenRecord = makeRayGenSbtRecord_(indent + "..");
+    sbt.raygenRecord = makeRaygenSbtRecord_(indent + "..");
 
     sbt.missRecordCount = 1;
     std::tie(sbt.missRecordBase, sbt.missRecordStrideInBytes)
         = makeMissSbtRecord_(indent + "..");
 
-    sbt.hitGroupRecordCount = 1;
-    std::tie(sbt.hitGroupRecordBase, sbt.hitGroupRecordStrideInBytes)
+    sbt.hitgroupRecordCount = 1;
+    std::tie(sbt.hitgroupRecordBase, sbt.hitgroupRecordStrideInBytes)
         = makeHitGroupSbtRecord_(indent + "..");
 
     sbt.callablesRecordBase = 0;
@@ -514,19 +564,29 @@ OptixShaderBindingTable MainWindow_Impl::makeOptixShaderBindingTable_(const std:
     return sbt;
 }
 
-void MainWindow_Impl::launchOptix_(const OptixShaderBindingTable& sbt,
+void MainWindow_Impl::launchOptix_(OptixTraversableHandle& gas_handle,
+                                   const OptixShaderBindingTable& sbt,
                                    const std::string& indent)
 {
+    constexpr int kNumThreads_x = 30;
+    constexpr int kNumThreads_y = 30;
+
+    manojr::OptixLaunchParams launchParams = makeOptixLaunchParams(kNumThreads_x, kNumThreads_y, gas_handle);
+    osc::CUDABuffer launchParamsOnGpu;
+    launchParamsOnGpu.alloc_and_upload(&launchParams, 1, cudaStream_);
     OPTIX_CHECK(
         optixLaunch(optixPipeline_,
-                    cuStream_, // TODO
-                    optixPipelineParams, // TODO
-                    optixPipelineParamsSize, // TODO
+                    cudaStream_,
+                    launchParamsOnGpu.d_pointer(),
+                    launchParamsOnGpu.sizeInBytes,
                     &sbt,
-                    width, // TODO
-                    height, // TODO
-                    depth) // TODO
+                    kNumThreads_x, // width
+                    kNumThreads_y, // height
+                    1)             // depth
     );
+    CUDA_CHECK( StreamSynchronize(cudaStream_) );
+    launchParamsOnGpu.download(&launchParams, 1, cudaStream_);
+    // launchParams.atomicNumPoints
 }
 
 void MainWindow_Impl::initializeOptix_()
@@ -542,33 +602,8 @@ void MainWindow_Impl::initializeOptix_()
 		createOptixDeviceContext_("..");
 		OptixTraversableHandle gas_handle = buildOptixAccelerationStructures_(indent);
         buildOptixPipeline_(indent);
-        buildOptixShaderBindingTable_(indent);
         OptixShaderBindingTable sbt = makeOptixShaderBindingTable_(indent);
-        launchOptix_(sbt, indent);
-		// Shader binding table
-
-		// Launch
-
-		CUstream cuStream; // TODO
-		CUdevicePtr pipelineParamsOnDevice; // TODO
-		size_t const pipelineParamSize; // TODO
-		OptixShaderBindingTable optixShaderBindingTable = {}; // TODO
-		{
-
-		}
-		unsigned int raygenWidth; // TODO
-		unsigned int raygenHeight; // TODO
-		unsigned int raygenDepth; // TODO
-		OPTIX_CHECK(optixLaunch(optixPipeline,
-		                        cuStream,
-								pipelineParamsOnDevice,
-								pipelineParamsSize,
-								&optixShaderBindingTable,
-								raygenWidth,
-								raygenHeight,
-								raygenDepth));
-
-
+        launchOptix_(gas_handle, sbt, indent);
 	}
 	catch(std::exception& e) {
 		this->LogError(QString(e.what()));
@@ -576,12 +611,13 @@ void MainWindow_Impl::initializeOptix_()
 }
 
 // TODO - call this with exception handling
-void MainWindow_Impl::releaseOptix_()
+void MainWindow_Impl::finalizeOptix_()
 {
     OPTIX_CHECK( optixProgramGroupDestroy(raygenProgramGroup_) );
     OPTIX_CHECK( optixProgramGroupDestroy(hitGroupProgramGroup_) );
     OPTIX_CHECK( optixProgramGroupDestroy(missProgramGroup_) );
-    CUDA_CHECK( Free((void*) gasBuildDevicePtr_) );
-	optixDestroyContext(optixDeviceContext_);
+    OPTIX_CHECK( optixPipelineDestroy(optixPipeline_) );
+    OPTIX_CHECK( optixModuleDestroy(optixModule_) );
+ 	optixDeviceContextDestroy(optixDeviceContext_);
 
 }
