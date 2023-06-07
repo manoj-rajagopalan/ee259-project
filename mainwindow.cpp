@@ -67,6 +67,7 @@ void MainWindow::ImportFile(const QString &pFileName) {
 															aiProcess_GenUVCoords | aiProcess_TransformUVCoords | aiProcess_FlipUVs);
 	if ( mScene != nullptr ) {
 		ui->lblLoadTime->setText(QString::number(time_begin.secsTo(QTime::currentTime())));
+		LogInfo("Scene has " + QString::number(mScene->mNumMeshes) + " meshes");
 		LogInfo("Import done: " + pFileName);
 		// Prepare widgets for new scene.
 		ui->leFileName->setText(pFileName.right(pFileName.length() - pFileName.lastIndexOf('/') - 1));
@@ -272,8 +273,10 @@ MainWindow::MainWindow(QWidget *parent)
 	mMouse_Transformation.Position_Pressed_Valid = false;
 
 	ui->setupUi(this);
+	mTabWidget = new QTabWidget(this);
+
 	// Create OpenGL widget
-	mGLView = new CGLView(this);
+	mGLView = new CGLView(mTabWidget);
 	mGLView->setMinimumSize(800, 600);
 	mGLView->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::MinimumExpanding);
 	mGLView->setFocusPolicy(Qt::StrongFocus);
@@ -281,8 +284,21 @@ MainWindow::MainWindow(QWidget *parent)
 	connect(mGLView, SIGNAL(Paint_Finished(size_t, GLfloat)), SLOT(Paint_Finished(size_t, GLfloat)));
 	connect(mGLView, SIGNAL(SceneObject_Camera(QString)), SLOT(SceneObject_Camera(QString)));
 	connect(mGLView, SIGNAL(SceneObject_LightSource(QString)), SLOT(SceneObject_LightSource(QString)));
+	mTabWidget->addTab(mGLView, tr("Model"));
+
+	// Create OpenGL widget for OptiX
+	mGLView_rayTraced = new CGLView(mTabWidget);
+	mGLView_rayTraced->setMinimumSize(800, 600);
+	mGLView_rayTraced->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::MinimumExpanding);
+	mGLView_rayTraced->setFocusPolicy(Qt::StrongFocus);
+	// Connect to GLView signals.
+	connect(mGLView_rayTraced, SIGNAL(Paint_Finished(size_t, GLfloat)), SLOT(Paint_Finished(size_t, GLfloat)));
+	connect(mGLView_rayTraced, SIGNAL(SceneObject_Camera(QString)), SLOT(SceneObject_Camera(QString)));
+	connect(mGLView_rayTraced, SIGNAL(SceneObject_LightSource(QString)), SLOT(SceneObject_LightSource(QString)));
+	mTabWidget->addTab(mGLView_rayTraced, tr("Ray-Traced"));
+
 	// and add it to layout
-	ui->hlMainView->insertWidget(0, mGLView, 4);
+	ui->hlMainView->insertWidget(0, mTabWidget, 4);
 	// Create logger
 	mLoggerView = new CLoggerView(ui->tbLog);
 	DefaultLogger::create("", Logger::VERBOSE);
@@ -414,7 +430,8 @@ void MainWindow::on_cbxLighting_clicked(bool pChecked)
 
 void MainWindow::on_lstLight_itemSelectionChanged()
 {
-bool selected = ui->lstLight->isItemSelected(ui->lstLight->currentItem());
+	// bool selected = ui->lstLight->isItemSelected(ui->lstLight->currentItem());
+	bool selected = ui->lstLight->currentItem()->isSelected();
 
 	if(selected)
 		mGLView->Lighting_EnableSource(ui->lstLight->currentRow());

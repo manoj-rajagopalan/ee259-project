@@ -40,18 +40,50 @@ struct ExecutionLogger
     std::string scope;
 };
 
+// Given a camera-to-world matrix, extract the camera origin and direction unit-vecs.
+void extractCameraParams(aiMatrix4D const& camera_to_world, manojr::Camera& camera)
+{
+    aiVector3D camera_x_in_world(camera_to_world[0][0], camera_to_world[1][0], camera_to_world[2][0]);
+    camera_x_in_world.Normalize();
+    p.camera.xAxis[0] = camera_x_in_world[0];
+    p.camera.xAxis[1] = camera_x_in_world[1];
+    p.camera.xAxis[2] = camera_x_in_world[2];
+
+    aiVector3D camera_y_in_world(camera_to_world[0][1], camera_to_world[1][1], camera_to_world[2][1]);
+    camera_y_in_world.Normalize();
+    p.camera.yAxis[0] = camera_y_in_world[0];
+    p.camera.yAxis[1] = camera_y_in_world[1];
+    p.camera.yAxis[2] = camera_y_in_world[2];
+
+    aiVector3D camera_z_in_world(camera_to_world[0][2], camera_to_world[1][2], camera_to_world[2][2]);
+    camera_z_in_world.Normalize();
+    p.camera.zAxis[0] = camera_z_in_world[0];
+    p.camera.zAxis[1] = camera_z_in_world[1];
+    p.camera.zAxis[2] = camera_z_in_world[2];
+
+    p.camera.origin[0] = camera_to_world[0][3];
+    p.camera.origin[1] = camera_to_world[1][3];
+    p.camera.origin[2] = camera_to_world[2][3];
+
+}
+
 // CPU-side Factory method
-manojr::OptixLaunchParams makeOptixLaunchParams(int numThreads_x,
-                                                int numThreads_y,
-                                                OptixTraversableHandle gas_handle)
+manojr::OptixLaunchParams makeOptixLaunchParams(OptixTraversableHandle gas_handle,
+                                                aiMatrix4D const& camera_to_world)
 {
     manojr::OptixLaunchParams p;
-    assert(numThreads_x > 0);
-    assert(numThreads_y > 0);
+    p.frame.x_resolution = 30;
+    p.frame.y_resolution = 30;
+    p.frame.width = TODO;
+    p.frame.height = TODO;
+
+    extractCameraParams(camera_to_world, p.camera);
+    p.camera.screenDimensions = TODO;
+
     osc::CUDABuffer resultBufferOnGpu;
-    resultBufferOnGpu.resize(numThreads_x * numThreads_y * 3*sizeof(float));
+    resultBufferOnGpu.resize(p.frame.x_resolution * p.frame.y_resolution * 3*sizeof(float));
     p.pointCloud = (float*) resultBufferOnGpu.d_pointer();
-    p.numThreads_x = numThreads_x;
+    p.numThreads_x = numThreads_x; // TODO
     p.numThreads_y = numThreads_y;
     p.atomicNumPoints = 0;
     p.gas_handle = gas_handle;
@@ -568,9 +600,6 @@ void MainWindow_Impl::launchOptix_(OptixTraversableHandle& gas_handle,
                                    const OptixShaderBindingTable& sbt,
                                    const std::string& indent)
 {
-    constexpr int kNumThreads_x = 30;
-    constexpr int kNumThreads_y = 30;
-
     manojr::OptixLaunchParams launchParams = makeOptixLaunchParams(kNumThreads_x, kNumThreads_y, gas_handle);
     osc::CUDABuffer launchParamsOnGpu;
     launchParamsOnGpu.alloc_and_upload(&launchParams, 1, cudaStream_);

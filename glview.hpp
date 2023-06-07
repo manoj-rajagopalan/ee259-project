@@ -436,6 +436,8 @@ public:
 	/// \param [out] pTranslation_Camera - translation vector from camera to the scene.
 	void Camera_Matrix(aiMatrix4x4& pRotation_Camera, aiMatrix4x4& pRotation_Scene, aiVector3D& pTranslation_Camera);
 
+	aiMatrix4x4 WorldToSceneTransform() const;
+
 signals:
 
 	/// \fn void Paint_Finished(const size_t pPaintTime, const GLfloat pDistance)
