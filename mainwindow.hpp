@@ -135,7 +135,9 @@ private slots:
 
 protected:
     Ui::MainWindow *ui;
+	QTabWidget *mTabWidget;
     CGLView *mGLView;///< Pointer to OpenGL render.
+    CGLView *mGLView_rayTraced;///< Pointer to OpenGL render for OptiX.
     CLoggerView *mLoggerView;///< Pointer to logging object.
     Assimp::Importer mImporter;///< Assimp importer.
     const aiScene* mScene;///< Pointer to loaded scene (\ref aiScene).

@@ -4,14 +4,22 @@
 
 namespace manojr {
 
-struct RayEmitter
+struct Frame
+{
+    int32_t x_resolution; // pixels, even
+    int32_t y_resolution; // pixels, even
+    float width; // m
+    float height; // m
+};
+
+struct Camera
 {
     // All items in world-space
-    float3 origin;
-    float3 xAxis;
-    float3 yAxis;
-    float3 zAxis; // look direction
-    float3 screenDimensions; // z-axis is distance to screen from origin
+    float3 origin; // m
+    float3 xAxis; // unit vec
+    float3 yAxis; // unit vec
+    float3 zAxis; // unit vec, negative of "look" direction
+    float3 screenDimensions; // m, z-axis is distance to screen from origin
 };
 
 
@@ -22,7 +30,8 @@ struct OptixLaunchParams
     int numThreads_y;
     int atomicNumPoints;
     OptixTraversableHandle gas_handle;
-    RayEmitter rayEmitter;
+    Camera camera;
+    Frame frame;
 };
 
 }
