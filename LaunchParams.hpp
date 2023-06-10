@@ -2,36 +2,21 @@
 
 #include <optix.h>
 
+#include "transmitter.hpp"
 namespace manojr {
-
-struct Frame
-{
-    int32_t x_resolution; // pixels, even
-    int32_t y_resolution; // pixels, even
-    float width; // m
-    float height; // m
-};
-
-struct Camera
-{
-    // All items in world-space
-    float3 origin; // m
-    float3 xAxis; // unit vec
-    float3 yAxis; // unit vec
-    float3 zAxis; // unit vec, negative of "look" direction
-    float3 screenDimensions; // m, z-axis is distance to screen from origin
-};
-
 
 struct OptixLaunchParams
 {
-    float *pointCloud;
-    int numThreads_x;
-    int numThreads_y;
-    int atomicNumPoints;
-    OptixTraversableHandle gas_handle;
-    Camera camera;
-    Frame frame;
+    void *pointCloud; // array of float3
+    OptixTraversableHandle gasHandle;
+    Transmitter transmitter;
+    // TODO: transmitter orientation
+
+    // CPU must set to 0 before invoking ray-tracing.
+    // GPU threads will atomically increment for each collision.
+    // Upon return to CPU, we get number of rays that intersected scene.
+    // Max possible value is (sensor.numRays_x * sensor.numRays_y).
+    int gpuAtomicNumHits;
 };
 
 }

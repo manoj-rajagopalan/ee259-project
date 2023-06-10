@@ -206,6 +206,8 @@ private:
 	bool mCamera_DefaultAdded = true;///< If true then scene has no defined cameras and default was added, if false - scene has defined cameras.
 	GLdouble mCamera_FOVY = 45.0;///< Specifies the field of view angle, in degrees, in the y direction.
 	GLdouble mCamera_Viewport_AspectRatio;///< Specifies the aspect ratio that determines the field of view in the x direction. The aspect ratio is the ratio of x (width) to y (height).
+	GLdouble const mZnear = 1.0; ///< Distance of near plane from camera origin
+	GLdouble const mZfar = 1.0e5; ///< Distance of far plane from camera origin
 	// Lighting
 	bool mLightingEnabled = false;///< If true then OpenGL lighting is enabled (glEnable(GL_LIGHTING)), if false - disabled.
 	///TODO: map is goooood, but not for case when one image can be used in different materials with difference in: texture transformation, targeting of the

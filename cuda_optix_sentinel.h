@@ -23,42 +23,49 @@
 #include <sstream>
 #include <stdexcept>
 
-#define CUDA_CHECK(call)							\
-    {									\
-      cudaError_t rc = cuda##call;                                      \
-      if (rc != cudaSuccess) {                                          \
+#define CUDA_CHECK(call)						                    \
+    do {									                                              \
+      cudaError_t res = cuda##call;                                      \
+      if (res != cudaSuccess) {                                          \
         std::stringstream txt;                                          \
-        cudaError_t err =  rc; /*cudaGetLastError();*/                  \
-        txt << "CUDA Error " << cudaGetErrorName(err)                   \
-            << " (" << cudaGetErrorString(err) << ")";                  \
+        txt << "cuda" << #call << " error #" << res                     \
+            << " (" << cudaGetErrorName(res) << ')'                      \
+            << " at " << __FILE__ << ':' << __LINE__ << " : "           \
+            << cudaGetErrorString(res);                                 \
         throw std::runtime_error(txt.str());                            \
       }                                                                 \
-    }
+    } while(false)
 
-#define CUDA_CHECK_NOEXCEPT(call)                                        \
-    {									\
+#define CUDA_CHECK_NOEXCEPT(call)                                       \
+    do {									                                              \
       cuda##call;                                                       \
-    }
+    } while(false)
 
 #define OPTIX_CHECK( call )                                             \
-  {                                                                     \
+  do {                                                                  \
     OptixResult res = call;                                             \
     if( res != OPTIX_SUCCESS )                                          \
       {                                                                 \
-        std::stringstream s;                                            \
-        s << "Optix call (" << #call << ") failed with code " << res << " (line " << __LINE__ << ")"; \
+        std::stringstream txt;                                          \
+        txt << #call << " error #" << res                               \
+            << " (" << optixGetErrorName(res) << ')'                     \
+            << " at " << __FILE__ << ':' << __LINE__ << " : "           \
+            << optixGetErrorString(res);                                \
         throw std::runtime_error(s.str());                              \
       }                                                                 \
-  }
+  } while(false)
 
-#define CUDA_SYNC_CHECK()                                               \
-  {                                                                     \
-    cudaDeviceSynchronize();                                            \
-    cudaError_t error = cudaGetLastError();                             \
-    if( error != cudaSuccess )                                          \
+#define CUDA_STREAM_SYNC_CHECK() \
+  do { \
+    cudaStreamSynchronize(); \
+    cudaError_t const res = cudaGetLastError(); \
+    if( res != OPTIX_SUCCESS )                                          \
       {                                                                 \
-        std::stringstream s;                                            \
-        s << "error (" << __FILE__ << ": line " << __LINE__ << "): " << cudaGetErrorString(error) << "\n"; \
-        throw std::runtime_error(s.str())                               \
+        std::stringstream txt;                                          \
+        txt << " CUDA Error upon stream-sync #" << res                  \
+            << " (" << optixGetErrorName(res) << ')'                     \
+            << " at " << __FILE__ << ':' << __LINE__ << " : "           \
+            << optixGetErrorString(res);                                \
+        throw std::runtime_error(s.str());                              \
       }                                                                 \
-  }
+  } while(false)

@@ -10,13 +10,18 @@ SET(ee259_SRCS
     main.cpp
     mainwindow.hpp
     mainwindow.cpp
-    mainwindow_impl.hpp
-    mainwindow_impl.cpp
+    AssimpOptixRayTracer.hpp
+    AssimpOptixRayTracer.cpp
+    transmitter.hpp
     glview.hpp
     glview.cpp
     loggerview.hpp
-    loggerview.cpp)
-#- qt5_wrap_ui(ee259_UI_SRCS mainwindow.ui)
+    loggerview.cpp
+    ExecutionCursor.hpp
+    RaiiScopeLimitsLogger.hpp
+    LaunchParams.hpp
+    cuda_optix_sentinel.h
+    float3.hpp)
 
 INCLUDE_DIRECTORIES(/home/rmanoj/Software/NVIDIA-OptiX-SDK-7.7.0-linux64-x86_64/include)
 INCLUDE_DIRECTORIES(${CMAKE_SOURCE_DIR}/3rdparty)
