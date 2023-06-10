@@ -52,15 +52,16 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #	include <QtWidgets>
 #endif
 
-// Header files, project.
-#include "glview.hpp"
-#include "loggerview.hpp"
-
 // Header files, Assimp.
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 
 #include <optix.h>
+
+// Header files, project.
+#include "glview.hpp"
+#include "loggerview.hpp"
+#include "AssimpOptixRayTracer.hpp"
 
 namespace Ui { 
     class MainWindow; 
@@ -133,9 +134,8 @@ private slots:
 	void on_cbxTextures_clicked(bool checked);
 	void on_cbxDrawAxes_clicked(bool checked);
 
-protected:
+private:
     Ui::MainWindow *ui;
-	QTabWidget *mTabWidget;
     CGLView *mGLView;///< Pointer to OpenGL render.
     CGLView *mGLView_rayTraced;///< Pointer to OpenGL render for OptiX.
     CLoggerView *mLoggerView;///< Pointer to logging object.
@@ -150,7 +150,11 @@ protected:
         QPoint Position_Pressed_RMB;///< Position where was pressed right mouse button.
         aiMatrix4x4 Rotation_AroundCamera;///< Rotation matrix which set rotation angles of the scene around camera.
         aiMatrix4x4 Rotation_Scene;///< Rotation matrix which set rotation angles of the scene around own center.
+		bool Camera_Rotated;
+		bool Scene_Rotated;
     } mMouse_Transformation;
+
+	manojr::AssimpOptixRayTracer mAssimpOptixRayTracer;
 };
 
 std::unique_ptr<MainWindow> makeMainWindow();

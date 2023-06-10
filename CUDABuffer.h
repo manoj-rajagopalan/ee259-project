@@ -1,3 +1,8 @@
+// Manoj Rajagopalan's (manojr) contributions:
+// - Added per-CUDA-stream logic to this file.
+//   This allows asynchronous memcpy-s into GPU.
+//   Earlier, all operations worked on the default CUDA stream (#0).      
+
 // ======================================================================== //
 // Copyright 2018-2019 Ingo Wald                                            //
 //                                                                          //
@@ -16,7 +21,8 @@
 
 #pragma once
 
-#include "cuda_optix_sentinel.h"
+#include "cuda_optix_sentinel.h" // manojr
+
 // common std stuff
 #include <vector>
 #include <cassert>
@@ -44,8 +50,10 @@ namespace osc {
     //! re-size buffer to given number of bytes
     void resize(size_t sizeInBytes, cudaStream_t cudaStream = 0)
     {
-      if (d_ptr) free();
-      alloc(sizeInBytes, cudaStream);
+      if(sizeInBytes != this->sizeInBytes) {
+        if (d_ptr) free();
+        alloc(sizeInBytes, cudaStream);
+      }
     }
     
     //! allocate to given number of bytes
@@ -53,7 +61,7 @@ namespace osc {
     {
       assert(d_ptr == nullptr);
       this->sizeInBytes = sizeInBytes;
-      CUDA_CHECK( MallocAsync( (void**)&d_ptr, sizeInBytes, cudaStream) );
+      CUDA_CHECK( Malloc( (void**)&d_ptr, sizeInBytes, cudaStream) );
     }
 
     //! free allocated memory
@@ -62,22 +70,27 @@ namespace osc {
       CUDA_CHECK(Free(d_ptr));
       d_ptr = nullptr;
       sizeInBytes = 0;
+      numElements = 0;
+      sizeOfElement = 0;
     }
 
-    void yield() // ownership to another resource
+    // manojr
+    void* detach() // ownership to another resource
     {
+      void *result = d_ptr;
       d_ptr = nullptr;
+      return result;
     }
 
     template<typename T>
-    void alloc_and_upload(const std::vector<T> &vt, cudaStream_t cudaStream = 0)
+    void allocAndUpload(const std::vector<T> &vt, cudaStream_t cudaStream = 0)
     {
       alloc(vt.size()*sizeof(T), cudaStream);
       upload((const T*)vt.data(), vt.size(), cudaStream);
     }
     
     template<typename T>
-    void alloc_and_upload(T const *t, size_t count, cudaStream_t cudaStream = 0)
+    void allocAndUpload(T const *t, size_t count, cudaStream_t cudaStream = 0)
     {
       alloc(count*sizeof(T), cudaStream);
       upload(t, count, cudaStream);
@@ -89,26 +102,37 @@ namespace osc {
       assert(d_ptr != nullptr);
       assert(sizeInBytes == count*sizeof(T));
       this->numElements = count;
-      CUDA_CHECK (MemcpyAsync(d_ptr, (void *)t,
-                              count*sizeof(T),
-                              cudaMemcpyHostToDevice,
-                              cudaStream) );
+      this->sizeOfElement = sizeof(T);
+      CUDA_CHECK (Memcpy(d_ptr,
+                         (void *)t,
+                         count*sizeof(T),
+                         cudaMemcpyHostToDevice,
+                         cudaStream));
     }
     
     template<typename T>
     void download(T *t, size_t count, cudaStream_t cudaStream = 0)
     {
       assert(d_ptr != nullptr);
-      assert(sizeInBytes == count*sizeof(T));
-      assert(numElements == count);
-      CUDA_CHECK( MemcpyAsync((void *)t,
-                              d_ptr,
-                              count*sizeof(T),
-                              cudaMemcpyDeviceToHost,
-                              cudaStream));
+      assert(numElements >= count);
+      assert(sizeOfElement == sizeof(T));
+      assert(sizeInBytes >= count*sizeof(T));
+      CUDA_CHECK( Memcpy((void *)t,
+                         d_ptr,
+                         count*sizeof(T),
+                         cudaMemcpyDeviceToHost,
+                         cudaStream));
     }
     
-    size_t numElements{0};
+    template<typename T>
+    void download(std::vector<T>& v, cudaStream_t cudaStream = 0)
+    {
+      v.resize(this->numElements);
+      this->download(v.data(), v.size(), cudaStream);
+    }
+
+    size_t numElements{ 0 };
+    size_t sizeOfElement{ 0 };
     size_t sizeInBytes { 0 };
     void  *d_ptr { nullptr };
   };

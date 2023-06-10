@@ -64,7 +64,7 @@ void MainWindow::ImportFile(const QString &pFileName) {
 
 	// Try to import scene.
 	mScene = mImporter.ReadFile(pFileName.toStdString(), aiProcess_Triangulate | aiProcess_GenNormals | aiProcess_ValidateDataStructure | \
-															aiProcess_GenUVCoords | aiProcess_TransformUVCoords | aiProcess_FlipUVs);
+														 aiProcess_GenUVCoords | aiProcess_TransformUVCoords | aiProcess_FlipUVs);
 	if ( mScene != nullptr ) {
 		ui->lblLoadTime->setText(QString::number(time_begin.secsTo(QTime::currentTime())));
 		LogInfo("Scene has " + QString::number(mScene->mNumMeshes) + " meshes");
@@ -115,6 +115,38 @@ void MainWindow::ImportFile(const QString &pFileName) {
 		mGLView->updateGL();
 #else
 		mGLView->update();
+#endif // ASSIMP_QT4_VIEWER
+
+		// -- manojr -- Perform ray-tracing and visualize the point-cloud
+
+		mAssimpOptixRayTracer.setScene(*mScene);
+
+		{ // Set transmitter.
+			// Extract camera params to co-locate transmitter with.
+			aiMatrix4x4 rotationScene; // not used
+			aiMatrix4x4 worldToCamera; // rows represent camera axes in world coords
+			aiVector3D cameraPosition;
+			mGLView->Camera_Matrix(worldToCamera, rotationScene, cameraPosition);
+
+			manojr::Transmitter transmitter;
+			{
+				transmitter.position = cameraPosition; // Could encounter double --> float error for vec3
+				// unit-vectors set below
+				transmitter.width = 1.0f;
+				transmitter.height = 1.0f;
+				transmitter.numRays_x = 30;
+				transmitter.numRays_y = 30;
+			}
+			mAssimpOptixRayTracer.setTransmitter(transmitter);
+			mAssimpOptixRayTracer.setTransmitterTransform(worldToCamera.Transpose() /*modified!*/);
+		}
+
+		aiScene *const rayPointCloud = mAssimpOptixRayTracer.runRayTracing();
+		mGLView_rayTraced->SetScene(rayPointCloud, QString{}); // pointer ownership transferred
+#if ASSIMP_QT4_VIEWER
+		mGLView_rayTraced->updateGL();
+#else
+		mGLView_rayTraced->update();
 #endif // ASSIMP_QT4_VIEWER
 	}
 	else
@@ -170,6 +202,8 @@ void MainWindow::mousePressEvent(QMouseEvent* pEvent)
 			mMouse_Transformation.Position_Pressed_Valid = true;// set flag
 			// Store current transformation matrices.
 			mGLView->Camera_Matrix(mMouse_Transformation.Rotation_AroundCamera, mMouse_Transformation.Rotation_Scene, temp_v3);
+			mMouse_Transformation.Scene_Rotated = false;
+			mMouse_Transformation.Camera_Rotated = false;
 		}
 
 		if(pEvent->button() & Qt::LeftButton)
@@ -183,9 +217,31 @@ void MainWindow::mousePressEvent(QMouseEvent* pEvent)
 	}
 }
 
+/// @brief Perform ray-tracing and display results
+/// @param pEvent 
 void MainWindow::mouseReleaseEvent(QMouseEvent *pEvent)
 {
-	if(pEvent->buttons() == 0) mMouse_Transformation.Position_Pressed_Valid = false;
+	if(pEvent->buttons() == 0) {
+		mMouse_Transformation.Position_Pressed_Valid = false;
+		aiMatrix4x4 sceneRotation, worldToCamera;
+		aiVector3D cameraTranslation;
+		mGLView->Camera_Matrix(worldToCamera, sceneRotation, cameraTranslation);
+		if(mMouse_Transformation.Scene_Rotated) {
+			mAssimpOptixRayTracer.setSceneTransform(sceneRotation);
+			mMouse_Transformation.Scene_Rotated = false;
+		}
+		if(mMouse_Transformation.Camera_Rotated) {
+			mAssimpOptixRayTracer.setTransmitterTransform(worldToCamera.Transpose() /*modified!*/);
+			mMouse_Transformation.Camera_Rotated = false;
+		}
+		aiScene const *const rayPointCloud = mAssimpOptixRayTracer.runRayTracing();
+		mGLView_rayTraced->SetScene(rayPointCloud, QString()); // Pointer ownership transferred.
+	#if ASSIMP_QT4_VIEWER
+			mGLView_rayTraced->updateGL();
+	#else
+			mGLView_rayTraced->update();
+	#endif // ASSIMP_QT4_VIEWER
+	}
 
 }
 
@@ -202,6 +258,8 @@ void MainWindow::mouseMoveEvent(QMouseEvent* pEvent)
 				mGLView->Camera_RotateScene(dy, 0, dx, &mMouse_Transformation.Rotation_Scene);// Rotate around oX and oZ axises.
 			else
 				mGLView->Camera_RotateScene(dy, dx, 0, &mMouse_Transformation.Rotation_Scene);// Rotate around oX and oY axises.
+			
+			mMouse_Transformation.Camera_Rotated = true;
 
 	#if ASSIMP_QT4_VIEWER
 			mGLView->updateGL();
@@ -220,6 +278,8 @@ void MainWindow::mouseMoveEvent(QMouseEvent* pEvent)
 			else
 				mGLView->Camera_Rotate(dy, dx, 0, &mMouse_Transformation.Rotation_AroundCamera);// Rotate around oX and oY axises.
 
+			mMouse_Transformation.Scene_Rotated = true;
+
 	#if ASSIMP_QT4_VIEWER
 			mGLView->updateGL();
 	#else
@@ -231,7 +291,7 @@ void MainWindow::mouseMoveEvent(QMouseEvent* pEvent)
 
 void MainWindow::keyPressEvent(QKeyEvent* pEvent)
 {
-GLfloat step;
+	GLfloat step;
 
 	if(pEvent->modifiers() & Qt::ControlModifier)
 		step = 10;
@@ -265,15 +325,18 @@ GLfloat step;
 /********************************************************************/
 
 MainWindow::MainWindow(QWidget *parent)
-	: QMainWindow(parent), ui(new Ui::MainWindow),
-		mScene(nullptr)
+	: QMainWindow(parent),
+	  ui(new Ui::MainWindow),
+	  mScene(nullptr),
+	  mAssimpOptixRayTracer([this](std::string const& infoMsg) { LogInfo(infoMsg.c_str()); },
+		                    [this](std::string const& errMsg) { LogError(errMsg.c_str()); })
 {
 
 	// other variables
 	mMouse_Transformation.Position_Pressed_Valid = false;
 
 	ui->setupUi(this);
-	mTabWidget = new QTabWidget(this);
+	QGridLayout gridLayout = new QGridLayout(this);
 
 	// Create OpenGL widget
 	mGLView = new CGLView(mTabWidget);
@@ -284,21 +347,17 @@ MainWindow::MainWindow(QWidget *parent)
 	connect(mGLView, SIGNAL(Paint_Finished(size_t, GLfloat)), SLOT(Paint_Finished(size_t, GLfloat)));
 	connect(mGLView, SIGNAL(SceneObject_Camera(QString)), SLOT(SceneObject_Camera(QString)));
 	connect(mGLView, SIGNAL(SceneObject_LightSource(QString)), SLOT(SceneObject_LightSource(QString)));
-	mTabWidget->addTab(mGLView, tr("Model"));
+	gridLayout->addItem(mGLView, 0, 0);
 
 	// Create OpenGL widget for OptiX
 	mGLView_rayTraced = new CGLView(mTabWidget);
 	mGLView_rayTraced->setMinimumSize(800, 600);
 	mGLView_rayTraced->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::MinimumExpanding);
 	mGLView_rayTraced->setFocusPolicy(Qt::StrongFocus);
-	// Connect to GLView signals.
-	connect(mGLView_rayTraced, SIGNAL(Paint_Finished(size_t, GLfloat)), SLOT(Paint_Finished(size_t, GLfloat)));
-	connect(mGLView_rayTraced, SIGNAL(SceneObject_Camera(QString)), SLOT(SceneObject_Camera(QString)));
-	connect(mGLView_rayTraced, SIGNAL(SceneObject_LightSource(QString)), SLOT(SceneObject_LightSource(QString)));
-	mTabWidget->addTab(mGLView_rayTraced, tr("Ray-Traced"));
+	gridLayout->addItem(mGLView_rayTraced);
 
 	// and add it to layout
-	ui->hlMainView->insertWidget(0, mTabWidget, 4);
+	ui->hlMainView->addItem(gridLayout);
 	// Create logger
 	mLoggerView = new CLoggerView(ui->tbLog);
 	DefaultLogger::create("", Logger::VERBOSE);

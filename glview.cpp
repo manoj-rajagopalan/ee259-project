@@ -624,7 +624,7 @@ void CGLView::resizeGL(int width, int height) {
 	glViewport(0, 0, width, height);
 	glMatrixMode(GL_PROJECTION);
 	glLoadIdentity();
-	gluPerspective(mCamera_FOVY, mCamera_Viewport_AspectRatio, 1.0, 100000.0);///TODO: znear/zfar depend on scene size.
+	gluPerspective(mCamera_FOVY, mCamera_Viewport_AspectRatio, mZnear, mZfar);///TODO: znear/zfar depend on scene size.
 }
 
 void CGLView::drawCoordSystem() {
@@ -958,9 +958,10 @@ void CGLView::SetScene(const aiScene *pScene, const QString& pScenePath) {
 
 		GLfloat val_x = ((mScene_BBox.Maximum.x - mScene_BBox.Minimum.x) / 2) / (mCamera_Viewport_AspectRatio * tg_angle);
 		GLfloat val_y = ((mScene_BBox.Maximum.y - mScene_BBox.Minimum.y) / 2) / tg_angle;
-		GLfloat val_step = val_x;
 
+		GLfloat val_step = val_x;
 		AssignIfGreater(val_step, val_y);
+		
 		mHelper_CameraDefault.Translation_ToScene.Set(mScene_Center.x, mScene_Center.y, val_step + mScene_BBox.Maximum.z);
 		emit SceneObject_Camera("_default");
 	}
