@@ -1160,18 +1160,3 @@ void CGLView::Camera_Matrix(aiMatrix4x4& pRotation_Camera, aiMatrix4x4& pRotatio
 	pRotation_Scene = mHelper_Camera.Rotation_Scene;
 	pTranslation_Camera = mHelper_Camera.Translation_ToScene;
 }
-
-
-aiMatrix4x4 CGLView::WorldToSceneTransform() const
-{
-	aiMatrix4x4 xform = mHelper_Camera.Rotation_AroundCamera;
-
-	aiVector4D translation_xform; // identity
-	aiVector3D const translation_vec = aiVector3D(0,0,0) - mHelper_Camera.Translation_ToScene;
-	aiMatrix4D::Translation(translation_vec, translation_xform);
-	xform *= translation_xform;
-
-	xform *= mHelper_Camera.Rotation_Scene;
-
-	return xform;
-}

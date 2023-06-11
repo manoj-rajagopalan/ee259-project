@@ -41,6 +41,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ---------------------------------------------------------------------------
 */
 
+#include <iostream>
+
 #include "mainwindow.hpp"
 #include "ui_mainwindow.h"
 
@@ -53,6 +55,20 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #endif // __unused
 
 using namespace Assimp;
+
+// manojr
+namespace {
+
+// a = b (compiler requires '=' operator to be non-static member function but target types is a CUDA typedef)
+inline
+void set(float3& a, const aiVector3D& b)
+{
+	a.x = b[0];
+	a.y = b[1];
+	a.z = b[2];
+}
+
+}
 
 void MainWindow::ImportFile(const QString &pFileName) {
     QTime time_begin = QTime::currentTime();
@@ -119,7 +135,18 @@ void MainWindow::ImportFile(const QString &pFileName) {
 
 		// -- manojr -- Perform ray-tracing and visualize the point-cloud
 
+		{
+			std::scoped_lock<std::mutex> rayTracingCommandLock(mRayTracingCommandMutex);
+			mRayTracingCommand = 2; // new scene
+			mRayTracingCommandConditionVariable.notify_one();
+		}
+		// TODO - these should go away after AssimpOptixRayTracer eventLoop
 		mAssimpOptixRayTracer.setScene(*mScene);
+		// Identity transform: copies model vertex buffer into world vertex buffer
+        // and also, importantly, builds all the OptiX geometry acceleration structures.
+        aiMatrix4x4 const identityTransform{};
+        mAssimpOptixRayTracer.setSceneTransform(identityTransform);
+
 
 		{ // Set transmitter.
 			// Extract camera params to co-locate transmitter with.
@@ -130,10 +157,11 @@ void MainWindow::ImportFile(const QString &pFileName) {
 
 			manojr::Transmitter transmitter;
 			{
-				transmitter.position = cameraPosition; // Could encounter double --> float error for vec3
+				set(transmitter.position, cameraPosition);
 				// unit-vectors set below
 				transmitter.width = 1.0f;
 				transmitter.height = 1.0f;
+				transmitter.focalLength = 1.0f;
 				transmitter.numRays_x = 30;
 				transmitter.numRays_y = 30;
 			}
@@ -141,8 +169,10 @@ void MainWindow::ImportFile(const QString &pFileName) {
 			mAssimpOptixRayTracer.setTransmitterTransform(worldToCamera.Transpose() /*modified!*/);
 		}
 
-		aiScene *const rayPointCloud = mAssimpOptixRayTracer.runRayTracing();
-		mGLView_rayTraced->SetScene(rayPointCloud, QString{}); // pointer ownership transferred
+		std::unique_lock<std::mutex> rayTracingResultLock(mRayTracingResultMutex);
+		aiScene *const rayTracingResultPointCloud = mAssimpOptixRayTracer.runRayTracing();
+		mRayTracingResult.reset(rayTracingResultPointCloud);
+		mGLView_rayTraced->SetScene(rayTracingResultPointCloud, QString{});
 #if ASSIMP_QT4_VIEWER
 		mGLView_rayTraced->updateGL();
 #else
@@ -328,47 +358,67 @@ MainWindow::MainWindow(QWidget *parent)
 	: QMainWindow(parent),
 	  ui(new Ui::MainWindow),
 	  mScene(nullptr),
-	  mAssimpOptixRayTracer([this](std::string const& infoMsg) { LogInfo(infoMsg.c_str()); },
-		                    [this](std::string const& errMsg) { LogError(errMsg.c_str()); })
+	  mAssimpOptixRayTracer(rayTracingMutex,
+	                        rayTracingConditionVariable,
+							rayTracingCommand)
 {
 
 	// other variables
 	mMouse_Transformation.Position_Pressed_Valid = false;
 
 	ui->setupUi(this);
-	QGridLayout gridLayout = new QGridLayout(this);
+	QGridLayout *const gridLayout = new QGridLayout(this);
+	this->setLayout(gridLayout);
 
 	// Create OpenGL widget
-	mGLView = new CGLView(mTabWidget);
-	mGLView->setMinimumSize(800, 600);
-	mGLView->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::MinimumExpanding);
+	mGLView = new CGLView(this);
+	mGLView->setMinimumSize(400, 300);
+	mGLView->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 	mGLView->setFocusPolicy(Qt::StrongFocus);
 	// Connect to GLView signals.
 	connect(mGLView, SIGNAL(Paint_Finished(size_t, GLfloat)), SLOT(Paint_Finished(size_t, GLfloat)));
 	connect(mGLView, SIGNAL(SceneObject_Camera(QString)), SLOT(SceneObject_Camera(QString)));
 	connect(mGLView, SIGNAL(SceneObject_LightSource(QString)), SLOT(SceneObject_LightSource(QString)));
-	gridLayout->addItem(mGLView, 0, 0);
+	gridLayout->addWidget(mGLView, 0, 0);
 
 	// Create OpenGL widget for OptiX
-	mGLView_rayTraced = new CGLView(mTabWidget);
-	mGLView_rayTraced->setMinimumSize(800, 600);
-	mGLView_rayTraced->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::MinimumExpanding);
+	mGLView_rayTraced = new manojr::CRayTracingGLView(this, mRayTracingResultMutex);
+	mGLView_rayTraced->setMinimumSize(400, 300);
+	mGLView_rayTraced->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 	mGLView_rayTraced->setFocusPolicy(Qt::StrongFocus);
-	gridLayout->addItem(mGLView_rayTraced);
+	gridLayout->addWidget(mGLView_rayTraced, 0, 1);
 
 	// and add it to layout
-	ui->hlMainView->addItem(gridLayout);
+	ui->hlMainView->addLayout(gridLayout);
 	// Create logger
 	mLoggerView = new CLoggerView(ui->tbLog);
 	DefaultLogger::create("", Logger::VERBOSE);
 	DefaultLogger::get()->attachStream(mLoggerView, DefaultLogger::Debugging | DefaultLogger::Info | DefaultLogger::Err | DefaultLogger::Warn);
 
 	ResetSceneInfos();
+
+	// std::function<void(std::string const&)> logInfo = [this](std::string const& s) { LogInfo(s.c_str()); } ;
+	// std::function<void(std::string const&)> logError = [this](std::string const& s) { LogError(s.c_str()); } ;
+	// mAssimpOptixRayTracer.registerLoggingFunctions(logInfo, logError);
+	std::function<void(std::string const&)> infoToCout = [](std::string const& s) { std::cout << s << std::endl; };
+	std::function<void(std::string const&)> errToCerr = [](std::string const& s) { std::cerr << s << std::endl; };
+	mAssimpOptixRayTracer.registerLoggingFunctions(infoToCout, errToCerr);
+	mRayTracingCommand = 0; // noop
+	mRayTracingThread = std::thread([&]() { mAssimpOptixRayTracer.eventLoop(); });	
 }
 
 MainWindow::~MainWindow()
 {
-using namespace Assimp;
+	{ // Signal ray-tracing thread to quit
+		LogInfo(tr("Signaled ray-tracing thread to quit."))
+		std::unique_lock<std::mutex> rayTracingLock(mRayTracingMutex);
+		mRayTracingCommand = -1; // quit
+		mRayTracingConditionVariable.notify_one();
+	}
+	mRayTracingThread.join();
+	LogInfo(tr("Ray-tracing thread has joined."));
+
+	using namespace Assimp;
 
 	DefaultLogger::get()->detachStream(mLoggerView, DefaultLogger::Debugging | DefaultLogger::Info | DefaultLogger::Err | DefaultLogger::Warn);
 	DefaultLogger::kill();

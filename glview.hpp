@@ -438,8 +438,6 @@ public:
 	/// \param [out] pTranslation_Camera - translation vector from camera to the scene.
 	void Camera_Matrix(aiMatrix4x4& pRotation_Camera, aiMatrix4x4& pRotation_Scene, aiVector3D& pTranslation_Camera);
 
-	aiMatrix4x4 WorldToSceneTransform() const;
-
 signals:
 
 	/// \fn void Paint_Finished(const size_t pPaintTime, const GLfloat pDistance)
@@ -457,4 +455,8 @@ signals:
 	/// Signal. Emit for every light source found in scene. Also for default light source.
 	/// \param [out] pName - name of the light source.
 	void SceneObject_LightSource(const QString& pName);
+
+protected:
+	aiScene* scene() { return mScene; }
+
 };// class CGLView

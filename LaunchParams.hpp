@@ -3,6 +3,7 @@
 #include <optix.h>
 
 #include "transmitter.hpp"
+
 namespace manojr {
 
 struct OptixLaunchParams
@@ -19,4 +20,4 @@ struct OptixLaunchParams
     int gpuAtomicNumHits;
 };
 
-}
+} // namespace manojr

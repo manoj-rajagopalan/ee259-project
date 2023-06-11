@@ -1,4 +1,4 @@
-#include "assimp_optix_ray_tracer.hpp"
+#include "AssimpOptixRayTracer.hpp"
 #include "cuda_optix_sentinel.h"
 
 // https://forums.developer.nvidia.com/t/linking-optix7-with-gcc/107036
@@ -8,23 +8,15 @@
 #include <cassert>
 #include <fstream>
 #include <iterator>
+#include <thread>
 
-#include "CUDABuffer.h"
 #include "LaunchParams.hpp"
-#include "ExecutionCursor.hpp"
 #include "RaiiScopeLimitsLogger.hpp"
-
-#include "mainwindow.hpp"
-
-std::unique_ptr<MainWindow> makeMainWindow()
-{
-	return std::make_unique<MainWindow_Impl>();
-}
 
 namespace {
 
 // Help OptiX runtime route error messages to
-AssimpOptixRayTracer *g_theAssimpOptixRayTracer = nullptr;
+manojr::AssimpOptixRayTracer *g_theAssimpOptixRayTracer = nullptr;
 
 void optixLogCallback(unsigned int level, const char *tag, const char *msg, void* /* cbData */)
 {
@@ -37,21 +29,55 @@ namespace manojr
 {
 
 AssimpOptixRayTracer::AssimpOptixRayTracer(
-    std::function<void(std::string const&)> logInfo,
-    std::function<void(std::string const&)> logError
+    std::mutex& rayTracingCommandMutex,
+    std::condition_variable& rayTracingCommandConditionVariable,
+    int& rayTracingCommand
 )
-: logInfo_{ logInfo },
-  logError_{ logError },
+: rayTracingCommandMutex_(rayTracingCommandMutex),
+  rayTracingCommandConditionVariable_(rayTracingCommandConditionVariable),
+  rayTracingCommand_(rayTracingCommand),
   executionFrame_{ 0 }
+{
+    // Capture all OptiX messages via optixLogCallback() above.
+    g_theAssimpOptixRayTracer = this;
+}
+
+void AssimpOptixRayTracer::eventLoop()
+{
+    initialize();
+    bool quit = false;
+    while(!false) {
+        std::unique_lock<std::mutex> lock(rayTracingCommandMutex_);
+        rayTracingCommandConditionVariable_.wait(lock, [](){ rayTracingCommand_ != 0; });
+        if(rayTracingCommand_ < 0) { // quit
+            rayTracingCommand_ = 0;
+            quit = true;
+        }
+        else if(rayTracingCommand_ == 1) { // ray-trace
+            rayTracingCommand_ = 0;
+            lock.unlock();
+            runRayTracing(); // TODO capture result
+        }
+        else if(rayTracingCommand_ == 2) { // new scene
+            setScene(scene);
+            aiMatrix4x4 identityTransform{};
+            setSceneTransform(identityTransform);
+            rayTracingCommand_ = 0;
+            lock.unlock();
+            runRayTracing(); // TODO capture result
+        }
+    }
+    finalize();
+}
+
+void AssimpOptixRayTracer::initialize()
 {
     ExecutionCursor whereInProgram;
     whereInProgram.frame = std::to_string(executionFrame_++);
-    RaiiScopeLimitsLogger scopeLog(logInfo_, whereInProgram, "AssimpOptixRayTracer CTOR");
+    RaiiScopeLimitsLogger scopeLog(logInfo_, whereInProgram, __func__);
 
-    g_theAssimpOptixRayTracer = this; // Route all OptiX messages
-    ExecutionCursor whereInSubProgram = whereInProgram.nexLevel();
-    initializeCuda_(whereInSubProgram.advance());
-    initializeOptix_(whereInSubProgram.advance());
+    initializeCuda_(whereInProgram.advance());
+    initializeOptix_(whereInProgram.advance());
 }
 
 AssimpOptixRayTracer::~AssimpOptixRayTracer()
@@ -59,9 +85,17 @@ AssimpOptixRayTracer::~AssimpOptixRayTracer()
     ExecutionCursor whereInProgram;
     whereInProgram.frame = std::to_string(executionFrame_++);
     RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, "AssimpOptixRayTracer DTOR");
-    ExecutionCursor whereInSubProgram = whereInProgram.nextLevel();
-    finalizeOptix_(whereInSubProgram.advance());
-    finalizeCuda_(whereInSubProgram.advance());
+    finalizeOptix_(whereInProgram.advance());
+    finalizeCuda_(whereInProgram.advance());
+}
+
+void AssimpOptixRayTracer::registerLoggingFunctions(
+    std::function<void(std::string const&)> logInfo,
+    std::function<void(std::string const&)> logError
+)
+{
+    logInfo_ = logInfo;
+    logError_ = logError;
 }
 
 void AssimpOptixRayTracer::initializeCuda_(ExecutionCursor whereInProgram)
@@ -69,20 +103,25 @@ void AssimpOptixRayTracer::initializeCuda_(ExecutionCursor whereInProgram)
     try {
         int cudaDeviceCount = 0;
         CUDA_CHECK( GetDeviceCount(&cudaDeviceCount) );
-        logInfo('[' + whereInProgram.toString() + "] "
-                + "Found " + std::to_string(cudaDeviceCount) + " CUDA device");
+        logInfo_('[' + whereInProgram.toString() + "] "
+                 + "Found " + std::to_string(cudaDeviceCount) + " CUDA device");
         assert(cudaDeviceCount == 1);
 
         int cudaDevice = -1;
         CUDA_CHECK( GetDevice(&cudaDevice) );
         cudaDeviceProp cudaDeviceProps;
         CUDA_CHECK( GetDeviceProperties(&cudaDeviceProps, cudaDevice) );
-        logInfo('[' + whereInProgram.toString() + "] "
-                + std::string("CUDA device name is ") + cudaDeviceProps.name);
+        logInfo_('[' + whereInProgram.toString() + "] "
+                 + std::string("CUDA device name is ") + cudaDeviceProps.name);
 
         CUDA_CHECK( SetDevice(cudaDevice) );
 
         CUDA_CHECK( StreamCreate(&cudaStream_) );
+        modelVertexBufferOnGpu_.cudaStream = cudaStream_;
+        worldVertexBufferOnGpu_.cudaStream = cudaStream_;
+        indexBufferOnGpu_.cudaStream = cudaStream_;
+        rayHitVerticesOnGpu_.cudaStream = cudaStream_;
+        gasBuild_.cudaStream = cudaStream_;
     }
     catch(std::exception& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -112,36 +151,37 @@ void AssimpOptixRayTracer::logOptixMessage(unsigned int level, const char *tag, 
 void AssimpOptixRayTracer::setScene(aiScene const& scene)
 {
     ExecutionCursor whereInProgram;
-    whereInProgram.frame = std::to_string(executionFrame++);
+    whereInProgram.frame = std::to_string(executionFrame_++);
     RaiiScopeLimitsLogger raiiScopeLogger(logInfo_, whereInProgram, __func__);
 
-    { // Check preconditions.
-        if(!mScene->HasMeshes()) {
-            logError_('[' + whereInProgram.toString() + "] ***ERROR*** Scene has no meshes!");
-            return;
-        }
-        if(scene.mNumMeshes != 1) {
-            logError_('[' + whereInProgram.toString() + "] ***ERROR*** Require scene to have 1 mesh. "
-                    "Has " + std::to_string(scene.mNumMeshes));
-            return;
-        }
-        aiMesh const& mesh = *scene.mMeshes[0];
-        if(mesh.mPrimitiveTypes != aiPrimitiveType_TRIANGLE) {
-            logError_('[' + whereInProgram.toString() + "] ***ERROR*** Require mesh to have only triangles."
-                    " Not the case");
-            return;
-        }
-    } // preconditions
+    if(!scene.HasMeshes()) {
+        logError_('[' + whereInProgram.toString() + "] ***ERROR*** Scene has no meshes!");
+        return;
+    }
+    if(scene.mNumMeshes != 1) {
+        logError_('[' + whereInProgram.toString() + "] ***ERROR*** Require scene to have 1 mesh. "
+                "Has " + std::to_string(scene.mNumMeshes));
+        return;
+    }
+    aiMesh const& mesh = *scene.mMeshes[0];
+    if(mesh.mPrimitiveTypes != aiPrimitiveType_TRIANGLE) {
+        logError_('[' + whereInProgram.toString() + "] ***ERROR*** Require mesh to have only triangles."
+                " Not the case");
+        return;
+    }
 
     // - Vertex and index buffers for geometry - 
 
     try {
-        modelVertexBufferOnGpu_.allocAndUpload(mesh.mVertices, mesh.mNumVertices, cudaStream_);
+        modelVertexBufferOnGpu_.asyncAllocAndUpload(mesh.mVertices, mesh.mNumVertices);
+        worldVertexBufferOnGpu_.asyncAlloc(mesh.mNumVertices * sizeof(aiVector3D));
+        worldVertexBufferOnGpu_.numElements = mesh.mNumVertices;
+        worldVertexBufferOnGpu_.sizeOfElement = sizeof(aiVector3D);
 
-        std::vector<int16_t> indexBuffer(mesh->mNumFaces * 3);
+        std::vector<int16_t> indexBuffer(mesh.mNumFaces * 3);
         int indexCounter = 0;
-        for(uint32_t i = 0; i < mesh->mNumFaces; ++i) {
-            const aiFace& face = mesh->mFaces[i];
+        for(uint32_t i = 0; i < mesh.mNumFaces; ++i) {
+            const aiFace& face = mesh.mFaces[i];
             assert(face.mNumIndices == 3);
             assert(face.mIndices[0] < (1u << 16));
             indexBuffer[indexCounter++] = (uint16_t) face.mIndices[0];
@@ -150,19 +190,7 @@ void AssimpOptixRayTracer::setScene(aiScene const& scene)
             assert(face.mIndices[2] < (1u << 16));
             indexBuffer[indexCounter++] = (uint16_t) face.mIndices[2];
         }
-        indexBufferOnGpu_.allocAndUpload(indexBuffer);
-
-        // Identity transform: copies model vertex buffer into world vertex buffer
-        // and also, importantly, builds all the OptiX geometry acceleration structures.
-        aiMatrix4D const identityTransform{}
-        setSceneTransform(identityTransform);
-
-        // - Buffer for results on GPU -
-
-        // In worst-case all rays will hit geometry.
-        rayHitVerticesOnGpu_.alloc(mesh.mVertices * sizeof(aiVertex3D), cudaStream_);
-        rayHitVerticesOnGpu_.sizeOfElement = sizeof(aiVertex3D);
-        rayHitVerticesOnGpu_.numElements = 0; // Haven't ray-traced yet.
+        indexBufferOnGpu_.asyncAllocAndUpload(indexBuffer);
     }
     catch(std::exception& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -172,7 +200,7 @@ void AssimpOptixRayTracer::setScene(aiScene const& scene)
 __device__ __forceinline__
 float inner_prod(float4 const& m, float3 const& v )
 {
-    return m[0]*v[0] + m[1]*v[1] + m[2]*v[2] + m[3] /* *1 */;
+    return m.x*v.x + m.y*v.y + m.z*v.z + m.w /* *1 */;
 }
 
 __global__
@@ -181,37 +209,38 @@ void transformVertexBufferOnGpu(void *worldVertices,
                                 int32_t const numVertices,
                                 void const *modelToWorldTransform /* 3x4, row-major*/)
 {
-    float3 *const w = ((float3*) worldVertices) + threadIdx.x;
-    float3 const *const v = ((float3 const*) modelVertices) + threadIdx.x;
+    int const linearIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    float3& w = *(((float3*) worldVertices) + linearIdx);
+    float3 const& v = *(((float3 const*) modelVertices) + linearIdx);
     float4 const *const M = (float4 const *) modelToWorldTransform;
-    w[0] = inner_prod(M[0], v);
-    w[1] = inner_prod(M[1], v);
-    w[2] = inner_prod(M[2], v);
+    w.x = inner_prod(M[0], v);
+    w.y = inner_prod(M[1], v);
+    w.z = inner_prod(M[2], v);
 }
 
-void AssimpOptixRayTracer::setSceneTransform(aiMatrix4D& modelToWorldTransform)
+void AssimpOptixRayTracer::setSceneTransform(aiMatrix4x4 const& modelToWorldTransform)
 {
     ExecutionCursor whereInProgram;
-    whereInProgram.frame = std::to_string(execFrame_++);
+    whereInProgram.frame = std::to_string(executionFrame_++);
     RaiiScopeLimitsLogger raiiScopeLogger(logInfo_, whereInProgram, __func__);
 
     try {
-        osc::CUDABuffer modelToWorldTransformOnGpu;
-        modelToWorldTransformOnGpu.allocAndUpload((float*) &modelToWorldTransform, 12, cudaStream_);
+        AsyncCudaBuffer modelToWorldTransformOnGpu{cudaStream_};
+        modelToWorldTransformOnGpu.asyncAllocAndUpload((float const*) &modelToWorldTransform, 12);
         // 8 block with 32 threads each
         int const kNumThreadsPerBlock = 32;
         // TODO: large meshes can exceed CUDA limits
         int const kNumBlocks = (modelVertexBufferOnGpu_.numElements + kNumThreadsPerBlock-1) / kNumThreadsPerBlock;
         transformVertexBufferOnGpu<<<kNumBlocks, kNumThreadsPerBlock, 0, cudaStream_>>>(
+            worldVertexBufferOnGpu_.d_pointer(),
             modelVertexBufferOnGpu_.d_pointer(),
             modelVertexBufferOnGpu_.numElements,
             modelToWorldTransformOnGpu.d_pointer()
         );
         CUDA_CHECK( GetLastError() );
 
-        ExecutionCursor whereInSubProgram = whereInProgram.nextLevel();
         // Rebuild BVH etc.
-        buildOptixAccelerationStructures_(whereInSubProgram.advance()); // set gasBuild_, gasHandle_
+        buildOptixAccelerationStructures_(whereInProgram.advance()); // set gasBuild_, gasHandle_
 
     }
     catch(std::exception const& e) {
@@ -219,21 +248,43 @@ void AssimpOptixRayTracer::setSceneTransform(aiMatrix4D& modelToWorldTransform)
     }
 }
 
-void AssimpOptixRayTracer::setTransmitterTransform(aiMatrix4D const& transmitterToWorldTransform)
-{
-	transmitter_.xUnitVector[0] = transmitterToWorldTransform[0][0];
-	transmitter_.xUnitVector[1] = transmitterToWorldTransform[1][0];
-	transmitter_.xUnitVector[2] = transmitterToWorldTransform[2][0];
-	
-	transmitter_.yUnitVector[0] = transmitterToWorldTransform[0][1];
-	transmitter_.yUnitVector[1] = transmitterToWorldTransform[1][1];
-	transmitter_.yUnitVector[2] = transmitterToWorldTransform[2][1];
-	
-	transmitter_.zUnitVector[0] = transmitterToWorldTransform[0][2];
-	transmitter_.zUnitVector[1] = transmitterToWorldTransform[1][2];
-	transmitter_.zUnitVector[2] = transmitterToWorldTransform[2][2];
+void AssimpOptixRayTracer::setTransmitter(manojr::Transmitter const& transmitter) {
+    transmitter_ = transmitter;
+
+    // Allocate on-GPU memory for ray-tracing results (collision points in world space).
+    // In worst-case all rays will hit geometry.
+    int32_t const numRays = transmitter_.numRays_x * transmitter_.numRays_y;
+    rayHitVerticesOnGpu_.asyncFree();
+    rayHitVerticesOnGpu_.asyncAlloc(numRays * sizeof(float3));
+    // The following metadata needs to be ready before we 'download' results from GPU to CPU.
+    rayHitVerticesOnGpu_.sizeOfElement = sizeof(float3);
+    // Haven't ray-traced yet.
+    // Will set this to the value of atomic counter (incremented by ray-collisions), post-ray-tracing.
+    rayHitVerticesOnGpu_.numElements = 0;
 }
 
+void AssimpOptixRayTracer::setTransmitterTransform(aiMatrix4x4 const& transmitterToWorldTransform /* 3x3 rotation matrix only! */)
+{
+    // Though the name mentions 'transform', this really is only a 3x3 rotation.
+    // The AssImp Qt Viewer library which provides our GLView implementation is sloppy with
+    // using 4x4 matrices to maintain 3x3 rotation, presumably because AssImp library itself
+    // has no notion of 3x3 matrices.
+
+    // The unit-vectors for the transmitter in world-space are simply the columns of the
+    // transmitter-to-world rotation matrix.
+
+	transmitter_.xUnitVector.x = transmitterToWorldTransform[0][0];
+	transmitter_.xUnitVector.y = transmitterToWorldTransform[1][0];
+	transmitter_.xUnitVector.z = transmitterToWorldTransform[2][0];
+	
+	transmitter_.yUnitVector.x = transmitterToWorldTransform[0][1];
+	transmitter_.yUnitVector.y = transmitterToWorldTransform[1][1];
+	transmitter_.yUnitVector.z = transmitterToWorldTransform[2][1];
+	
+	transmitter_.zUnitVector.x = transmitterToWorldTransform[0][2];
+	transmitter_.zUnitVector.y = transmitterToWorldTransform[1][2];
+	transmitter_.zUnitVector.z = transmitterToWorldTransform[2][2];
+}
 
 aiScene* AssimpOptixRayTracer::runRayTracing()
 {
@@ -245,36 +296,48 @@ aiScene* AssimpOptixRayTracer::runRayTracing()
     try {
         OptixLaunchParams launchParams{};
         {
-            OptixLaunchParams launchParams;
             launchParams.pointCloud = (void*) rayHitVerticesOnGpu_.d_pointer();
             launchParams.gasHandle = gasHandle_;
             launchParams.transmitter = transmitter_;
             launchParams.gpuAtomicNumHits = 0;
         }
-        osc::CUDABuffer launchParamsOnGpu;
-        launchParamsOnGpu.allocAndUpload(&launchParams, 1, cudaStream_);
+        AsyncCudaBuffer launchParamsOnGpu{cudaStream_};
+        launchParamsOnGpu.asyncAllocAndUpload(&launchParams, 1);
         OPTIX_CHECK(
             optixLaunch(optixPipeline_,
                         cudaStream_,
-                        launchParamsOnGpu.d_pointer(),
+                        (CUdeviceptr) launchParamsOnGpu.d_pointer(),
                         launchParamsOnGpu.sizeInBytes,
                         &optixSbt_,
-                        launchParams.transmitter.numRays_x, // width
-                        launchParams.transmitter.numRays_y, // height
-                        1) // depth
+                        launchParams.transmitter.numRays_x,
+                        launchParams.transmitter.numRays_y,
+                        1)
         );
         CUDA_CHECK( StreamSynchronize(cudaStream_) );
-        launchParamsOnGpu.download(&launchParams, 1, cudaStream_);
+        launchParamsOnGpu.asyncDownload(&launchParams, 1);
+        launchParamsOnGpu.sync(); // Ensure download completes before accessing results.
         rayHitVerticesOnGpu_.numElements = launchParams.gpuAtomicNumHits;
         
         aiMesh *const pointCloudMesh = new aiMesh;
         pointCloudMesh->mNumVertices = launchParams.gpuAtomicNumHits;
-        pointCloudMesh->mVertices = new aiVertex3D[launchParams.gpuAtomicNumHits];
-        rayHitVerticesOnGpu_.download(pointCloudMesh->mVertices, pointCloudMesh->mNumVertices, cudaStream_);
+        pointCloudMesh->mVertices = new aiVector3D[launchParams.gpuAtomicNumHits];
+        rayHitVerticesOnGpu_.asyncDownload(pointCloudMesh->mVertices, pointCloudMesh->mNumVertices);
+        rayHitVerticesOnGpu_.sync(); // Ensure download completes before accessing results.
 
-        pointCloudScene->mMeshes = new (aiMesh*)[1];
-        pointCloudScene-> mMeshes[0] = pointCloudMesh;
+        using aiMeshPtr_t = aiMesh*;
+        pointCloudScene->mMeshes = new aiMeshPtr_t[1];
+        pointCloudScene->mMeshes[0] = pointCloudMesh;
         pointCloudScene->mNumMeshes = 1;
+
+        // Scenes must have a root node which indexes into the master mesh-array within the parent scene.
+        aiNode *const pointCloudNode = new aiNode;
+        pointCloudNode->mName = "point-cloud";
+        pointCloudNode->mNumMeshes = 1;
+        pointCloudNode->mMeshes = new unsigned int [pointCloudNode->mNumMeshes];
+        pointCloudNode->mMeshes[0] = 0; // First entry in the array of meshes in the scene.
+        pointCloudNode->mNumChildren = 0;
+        pointCloudNode->mChildren = nullptr;
+        pointCloudScene->mRootNode = pointCloudNode;
     }
     catch(std::exception const& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -291,7 +354,6 @@ void AssimpOptixRayTracer::createOptixDeviceContext_(ExecutionCursor whereInProg
         optixDeviceContextOptions.logCallbackFunction = &optixLogCallback;
         optixDeviceContextOptions.logCallbackLevel = 4;
         optixDeviceContextOptions.validationMode = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL;
-        OptixDeviceContext optixDeviceContext;
         OPTIX_CHECK(
             optixDeviceContextCreate(cuCtx_, &optixDeviceContextOptions, &optixDeviceContext_)
         );
@@ -325,16 +387,17 @@ void AssimpOptixRayTracer::buildOptixAccelerationStructures_(ExecutionCursor whe
 
 		// https://raytracing-docs.nvidia.com/optix7/api/struct_optix_build_input_triangle_array.html
         OptixBuildInputTriangleArray& triangleArray = optixBuildInput.triangleArray;
-		triangleArray.vertexBuffers = &(worldVertexBufferOnGpu_.d_pointer_ref());
+		triangleArray.vertexBuffers = (CUdeviceptr*) &(worldVertexBufferOnGpu_.d_ptr);
 		triangleArray.numVertices = (unsigned int) worldVertexBufferOnGpu_.numElements;
 		// https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#ga55c6d96161ef202d48023a8a1d126102
 		triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+        triangleArray.vertexStrideInBytes = 0; // tightly-packed
 
-		triangleArray.indexBuffer = indexBufferOnGpu_.d_pointer();
-		triangleArray.numIndexTriplets = (unsigned int) indexBufferOnGpu_.numElements;
-		https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#gaa98b8fb6bf2d2455c310125f3fab74e6
+		triangleArray.indexBuffer = (CUdeviceptr) indexBufferOnGpu_.d_pointer();
+		triangleArray.numIndexTriplets = (unsigned int) indexBufferOnGpu_.numElements / 3; // triplets, remember?
+		// https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#gaa98b8fb6bf2d2455c310125f3fab74e6
 		triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_SHORT3;
-		triangleArray.indexStrideInBytes = 0; // tightly packed
+		triangleArray.indexStrideInBytes = 0; // tightly-packed
 
         const unsigned int triangle_flags[]{OPTIX_GEOMETRY_FLAG_NONE};
         triangleArray.flags = triangle_flags;
@@ -342,7 +405,7 @@ void AssimpOptixRayTracer::buildOptixAccelerationStructures_(ExecutionCursor whe
 	}
 
     // Compute buffer sizes for building acceleration structures
-	OptixAccelBufferSizes optixAccelBufferSizes = {};
+	OptixAccelBufferSizes optixAccelBufferSizes{};
 	OPTIX_CHECK(
 		optixAccelComputeMemoryUsage(optixDeviceContext_,
 		                             &optixAccelBuildOptions,
@@ -352,18 +415,18 @@ void AssimpOptixRayTracer::buildOptixAccelerationStructures_(ExecutionCursor whe
     assert(optixAccelBufferSizes.tempUpdateSizeInBytes == 0);
 
     // Allocate buffers for the build
-    gasBuild_.resize(optixAccelBufferSizes.outputSizeInBytes);
+    gasBuild_.asyncResize(optixAccelBufferSizes.outputSizeInBytes);
 
-    osc::CUDABuffer gasBuildTemp;
-    gasBuildTemp.resize(optixAccelBufferSizes.tempSizeInBytes);
+    AsyncCudaBuffer gasBuildTemp{cudaStream_};
+    gasBuildTemp.asyncResize(optixAccelBufferSizes.tempSizeInBytes);
 
     OPTIX_CHECK(
         optixAccelBuild(optixDeviceContext_,
                         cudaStream_,
                         &optixAccelBuildOptions,
                         &optixBuildInput, 1,
-                        gasBuildTemp.d_pointer(), gasBuildTemp.sizeInBytes,
-                        gasBuild_.d_pointer(), gasBuild_.sizeInBytes,
+                        (CUdeviceptr) gasBuildTemp.d_pointer(), gasBuildTemp.sizeInBytes,
+                        (CUdeviceptr) gasBuild_.d_pointer(), gasBuild_.sizeInBytes,
                         &gasHandle_,
                         nullptr, 0 // emitted properties
                         );
@@ -375,11 +438,13 @@ std::string AssimpOptixRayTracer::loadOptixModuleSourceCode_(ExecutionCursor whe
     RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
     std::string sourceCode;
     try {
-        std::ifstream sourceCodeFile("ee259.cu");
+        std::ifstream sourceCodeFile("ee259.ptx");
         // https://stackoverflow.com/a/2912614
         std::istreambuf_iterator<char> sourceCodeFileIter{sourceCodeFile};
         sourceCode.assign(sourceCodeFileIter,
                           std::istreambuf_iterator<char>{});
+        logInfo_('[' + whereInProgram.toString() + "] Source code has "
+                 + std::to_string(sourceCode.size()) + " chars");
     }
     catch(std::exception const& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -392,7 +457,7 @@ void AssimpOptixRayTracer::makeOptixModule_(OptixPipelineCompileOptions optixPip
                                             size_t logBufferSize,
                                             ExecutionCursor whereInProgram)
 {
-    RaiiScopeLimitsLogger execLog(logInfo_, whereInProgram, __func__);
+    RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
     try {
         ExecutionCursor whereInSubProgram = whereInProgram.nextLevel();
 
@@ -413,12 +478,12 @@ void AssimpOptixRayTracer::makeOptixModule_(OptixPipelineCompileOptions optixPip
         std::string optixModuleSourceCode = loadOptixModuleSourceCode_(whereInSubProgram.advance());
         OPTIX_CHECK(
             optixModuleCreate(optixDeviceContext_,
-                            &optixModuleCompileOptions,
-                            &optixPipelineCompileOptions,
-                            optixModuleSourceCode.c_str(),
-                            optixModuleSourceCode.size(),
-                            logBuffer, &logBufferSize,
-                            &optixModule_)
+                              &optixModuleCompileOptions,
+                              &optixPipelineCompileOptions,
+                              optixModuleSourceCode.c_str(),
+                              optixModuleSourceCode.size(),
+                              logBuffer, &logBufferSize,
+                              &optixModule_)
         );
     }
     catch(std::exception const& e) {
@@ -440,10 +505,10 @@ OptixPipelineCompileOptions AssimpOptixRayTracer::makeOptixPipelineCompileOption
                                                  OPTIX_EXCEPTION_FLAG_TRACE_DEPTH |
                                                  OPTIX_EXCEPTION_FLAG_USER |
                                                  OPTIX_EXCEPTION_FLAG_DEBUG;
-    optixPipelineCompileOptions.pipelineLaunchParamsVariableName = 0; // TODO
+    optixPipelineCompileOptions.pipelineLaunchParamsVariableName = "launchParams";
     // https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#ga1171b332da08991dd9e6ef54b52b3ba4
     optixPipelineCompileOptions.usesPrimitiveTypeFlags = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
-    optixPipelineCompileOptions.allowOpacityMicromaps = 0;
+    optixPipelineCompileOptions.allowOpacityMicromaps = 0u;
     return optixPipelineCompileOptions;
 }
 
@@ -476,18 +541,19 @@ void AssimpOptixRayTracer::makeRaygenProgramGroup_(char *logBuffer,
             raygenProgramGroupDescription.raygen.entryFunctionName = "__raygen__rg";
         }
 
-        OptixProgramGroupOptions *raygenProgramGroupOptions = nullptr; // no payload
+        // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_program_group_options.html
+        OptixProgramGroupOptions raygenProgramGroupOptions{}; // no payload
 
         // https://raytracing-docs.nvidia.com/optix7/api/optix__host_8h.html#aa3515445a876a8a381ced002e4020d42
         OPTIX_CHECK(
             optixProgramGroupCreate(optixDeviceContext_,
                                     &raygenProgramGroupDescription, 1, // array
-                                    raygenProgramGroupOptions,
+                                    &raygenProgramGroupOptions,
                                     logBuffer, &logBufferSize, // modified
                                     &raygenProgramGroup_)
         );
-        optixLogBuffer[optixLogBufferSize] = '\0';
-        logInfo_('[' + whereInProgram.toString() + "] " + (char*) optixLogBuffer);
+        logBuffer[logBufferSize] = '\0';
+        logInfo_('[' + whereInProgram.toString() + "] " + (char*) logBuffer);
     }
     catch(std::exception const& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -515,18 +581,19 @@ void AssimpOptixRayTracer::makeHitGroupProgramGroup_(char *logBuffer,
             hitGroupProgramGroupDescription.hitgroup.entryFunctionNameCH = "__closesthit__xpoint";
         }
 
-        OptixProgramGroupOptions *hitGroupProgramGroupOptions = nullptr; // no payload
+        // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_program_group_options.html
+        OptixProgramGroupOptions hitGroupProgramGroupOptions{}; // no payload
 
         // https://raytracing-docs.nvidia.com/optix7/api/optix__host_8h.html#aa3515445a876a8a381ced002e4020d42
         OPTIX_CHECK(
             optixProgramGroupCreate(optixDeviceContext_,
-                                    &hitGroupProgramGroupDesc, 1, // array
-                                    hitGroupProgramGroupOptions,
+                                    &hitGroupProgramGroupDescription, 1, // array
+                                    &hitGroupProgramGroupOptions,
                                     logBuffer, &logBufferSize,
                                     &hitGroupProgramGroup_)
         );
-        optixLogBuffer[optixLogBufferSize] = '\0';
-        logInfo_('[' + whereInProgram.toString() + "] " + (char*) optixLogBuffer);
+        logBuffer[logBufferSize] = '\0';
+        logInfo_('[' + whereInProgram.toString() + "] " + (char*) logBuffer);
     }
     catch(std::exception const& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -540,10 +607,9 @@ void AssimpOptixRayTracer::makeMissProgramGroup_(char *logBuffer,
     RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
     try {
         // https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#ga0b44fd0708cced8b77665cfac5453573
+        // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_program_group_desc.html
         OptixProgramGroupDesc missProgramGroupDescription{};
         {
-            // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_program_group_desc.html
-            OptixProgramGroupDesc missProgramGroupDescription;
             // https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#gabca35b1218b4df575a5c42926da0d978
             missProgramGroupDescription.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
             // https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#gaa65e764f5bba97fda45d4453c0464596
@@ -553,18 +619,19 @@ void AssimpOptixRayTracer::makeMissProgramGroup_(char *logBuffer,
             missProgramGroupDescription.miss.module = optixModule_;
             missProgramGroupDescription.miss.entryFunctionName = "__miss__noop";
         }
-        OptixProgramGroupOptions *missProgramGroupOptions = nullptr; // no payload
+        // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_program_group_options.html
+        OptixProgramGroupOptions missProgramGroupOptions{}; // no payload
 
         // https://raytracing-docs.nvidia.com/optix7/api/optix__host_8h.html#aa3515445a876a8a381ced002e4020d42
         OPTIX_CHECK(
             optixProgramGroupCreate(optixDeviceContext_,
-                                    &missProgramGroupDesc, 1, // array
-                                    missProgramGroupOptions,
+                                    &missProgramGroupDescription, 1, // array
+                                    &missProgramGroupOptions,
                                     logBuffer, &logBufferSize,
                                     &missProgramGroup_)
         );
-        optixLogBuffer[optixLogBufferSize] = '\0';
-        logInfo_('[' + whereInProgram.toString() + "] " + (char*) optixLogBuffer);
+        logBuffer[logBufferSize] = '\0';
+        logInfo_('[' + whereInProgram.toString() + "] " + (char*) logBuffer);
     }
     catch(std::exception const& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -590,9 +657,9 @@ void AssimpOptixRayTracer::buildOptixPipeline_(ExecutionCursor whereInProgram)
                         whereInSubProgram.advance());
         OptixPipelineLinkOptions optixPipelineLinkOptions =
             makeOptixPipelineLinkOptions_();
-        makeRaygenProgramGroup_(optixLogBuffer, kOptixLogBufferSize-1, whereInSubProgram.advance();
-        makeHitGroupProgramGroup_(optixLogBuffer, kOptixLogBufferSize-1, whereInSubProgram.advance();
-        makeMissProgramGroup_(optixLogBuffer, kOptixLogBufferSize-1, whereInSubProgram.advance();
+        makeRaygenProgramGroup_(optixLogBuffer, kOptixLogBufferSize-1, whereInSubProgram.advance());
+        makeHitGroupProgramGroup_(optixLogBuffer, kOptixLogBufferSize-1, whereInSubProgram.advance());
+        makeMissProgramGroup_(optixLogBuffer, kOptixLogBufferSize-1, whereInSubProgram.advance());
 
         constexpr unsigned int kNumProgramGroups = 3;
         std::array<OptixProgramGroup, kNumProgramGroups> optixProgramGroups{
@@ -633,20 +700,20 @@ using MissSbtRecord = ShaderBindingTableRecord<MissData>;
 struct HitGroupData { /* TODO */ };
 using HitGroupSbtRecord = ShaderBindingTableRecord<HitGroupData>;
 
-CUdeviceptr
+void*
 AssimpOptixRayTracer::makeRaygenSbtRecord_(ExecutionCursor whereInProgram)
 {
     RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
-    CUdeviceptr result { nullptr };
+    void* result { nullptr };
     try {
+        RayGenSbtRecord raygenSbtRecord;
         OPTIX_CHECK(
             optixSbtRecordPackHeader(raygenProgramGroup_, (void*) &raygenSbtRecord)
         );
-        RayGenSbtRecord raygenSbtRecord;
         // Populate raygenSbtRecord.data here if needed in future
-        osc::CUDABuffer raygenSbtRecordOnGpu;
-        raygenSbtRecordOnGpu.allocAndUpload(&raygenSbtRecord, 1);
-        result = (CUdeviceptr) raygenSbtRecordOnGpu.detach();
+        AsyncCudaBuffer raygenSbtRecordOnGpu{cudaStream_};
+        raygenSbtRecordOnGpu.asyncAllocAndUpload(&raygenSbtRecord, 1);
+        result = raygenSbtRecordOnGpu.detach();
     }
     catch(std::exception const& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -654,20 +721,21 @@ AssimpOptixRayTracer::makeRaygenSbtRecord_(ExecutionCursor whereInProgram)
     return result;
 }
 
-std::pair<CUdeviceptr, unsigned int>
+std::pair<void*, unsigned int>
 AssimpOptixRayTracer::makeMissSbtRecord_(ExecutionCursor whereInProgram)
 {
     RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
-    std::pair<CUdeviceptr, unsigned int> result { nullptr, 0 };
+    std::pair<void*, unsigned int> result { 0, 0 };
     try {
+        MissSbtRecord missSbtRecord;
         OPTIX_CHECK(
             optixSbtRecordPackHeader(missProgramGroup_, (void*) &missSbtRecord)
         );
-        osc::CUDABuffer missSbtRecordOnGpu;
-        MissSbtRecord missSbtRecord;
-        missSbtRecordOnGpu.allocAndUpload(&missSbtRecord, 1);
-        result.first = (CUdeviceptr) missSbtRecordOnGpu.detach();
+        AsyncCudaBuffer missSbtRecordOnGpu{cudaStream_};
+        missSbtRecordOnGpu.asyncAllocAndUpload(&missSbtRecord, 1);
         result.second = missSbtRecordOnGpu.sizeInBytes;
+        // Destroys internal metadata, so ordered after extracting sizeInBytes.
+        result.first = missSbtRecordOnGpu.detach();
     }
     catch(std::exception const& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -675,20 +743,21 @@ AssimpOptixRayTracer::makeMissSbtRecord_(ExecutionCursor whereInProgram)
     return result;
 }
 
-std::pair<CUdeviceptr, unsigned int>
+std::pair<void*, unsigned int>
 AssimpOptixRayTracer::makeHitGroupSbtRecord_(ExecutionCursor whereInProgram)
 {
     RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
-    std::pair<CUdeviceptr, unsigned int> result;
+    std::pair<void*, unsigned int> result{ 0, 0 };
     try {
-        MissSbtRecord hitGroupSbtRecord;
+        HitGroupSbtRecord hitGroupSbtRecord;
         OPTIX_CHECK(
             optixSbtRecordPackHeader(hitGroupProgramGroup_, (void*) &hitGroupSbtRecord)
         );
-        osc::CUDABuffer hitGroupSbtRecordOnGpu;
-        hitGroupSbtRecordOnGpu.allocAndUpload(&hitGroupSbtRecord, 1);
-        result.first = (CUdeviceptr) hitGroupSbtRecordOnGpu.detach();
+        AsyncCudaBuffer hitGroupSbtRecordOnGpu{cudaStream_};
+        hitGroupSbtRecordOnGpu.asyncAllocAndUpload(&hitGroupSbtRecord, 1);
         result.second = hitGroupSbtRecordOnGpu.sizeInBytes;
+        // Destroys internal metadata, so ordered after extracting sizeInBytes.
+        result.first = hitGroupSbtRecordOnGpu.detach();
     }
     catch(std::exception const& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -703,15 +772,17 @@ void AssimpOptixRayTracer::makeOptixShaderBindingTable_(ExecutionCursor whereInP
     RaiiScopeLimitsLogger raiiScopeLogger(logInfo_, whereInProgram, __func__);
     try {
         ExecutionCursor whereInSubProgram = whereInProgram.nextLevel();
-        sbt.raygenRecord = makeRaygenSbtRecord_(whereInSubProgram.advance());
+        optixSbt_.raygenRecord = (CUdeviceptr) makeRaygenSbtRecord_(whereInSubProgram.advance());
 
         optixSbt_.missRecordCount = 1;
-        std::tie(optixSbt_.missRecordBase, optixSbt_.missRecordStrideInBytes)
-            = makeMissSbtRecord_(whereInSubProgram.advance());
+        std::pair<void*, unsigned int> missSbtRecordInfo = makeMissSbtRecord_(whereInSubProgram.advance());
+        optixSbt_.missRecordBase = (CUdeviceptr) missSbtRecordInfo.first;
+        optixSbt_.missRecordStrideInBytes = missSbtRecordInfo.second;
 
         optixSbt_.hitgroupRecordCount = 1;
-        std::tie(optixSbt_.hitgroupRecordBase, optixSbt_.hitgroupRecordStrideInBytes)
-            = makeHitGroupSbtRecord_(whereInSubProgram.advance());
+        std::pair<void*, unsigned int> hitGroupSbtRecordInfo = makeHitGroupSbtRecord_(whereInSubProgram.advance());
+        optixSbt_.hitgroupRecordBase = (CUdeviceptr) hitGroupSbtRecordInfo.first;
+        optixSbt_.hitgroupRecordStrideInBytes = hitGroupSbtRecordInfo.second;
 
         optixSbt_.callablesRecordBase = 0;
         optixSbt_.callablesRecordCount = 0;
@@ -732,19 +803,19 @@ void AssimpOptixRayTracer::initializeOptix_(ExecutionCursor whereInProgram)
 	cuCtx_ = 0;
     ExecutionCursor whereInSubProgram = whereInProgram.nextLevel();
 	try {
-		OPTIX_CHECK(optixInit() , whereInProgram);
+		OPTIX_CHECK(optixInit());
 		createOptixDeviceContext_(whereInSubProgram.advance()); // set optixDeviceContext_
         buildOptixPipeline_(whereInSubProgram.advance()); // set optixModule_, optixPipeline_
         makeOptixShaderBindingTable_(whereInSubProgram.advance()); // set optixSbt_
 	}
 	catch(std::exception& e) {
-		logError(e.what());
+		logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
 	}
 }
 
 void AssimpOptixRayTracer::finalizeOptix_(ExecutionCursor whereInProgram)
 {
-    RaiiScopedLimitsLogger raiiScopeLogger(logInfo_, whereInProgram, __func__);
+    RaiiScopeLimitsLogger raiiScopeLogger(logInfo_, whereInProgram, __func__);
     try {
         OPTIX_CHECK( optixProgramGroupDestroy(raygenProgramGroup_) );
         OPTIX_CHECK( optixProgramGroupDestroy(hitGroupProgramGroup_) );
