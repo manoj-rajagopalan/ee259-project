@@ -51,8 +51,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
-    std::unique_ptr<MainWindow> win = makeMainWindow();
-    win->show();
+    MainWindow win{};
+    win.show();
 
     return app.exec();
 }

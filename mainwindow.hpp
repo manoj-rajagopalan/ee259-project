@@ -43,7 +43,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #pragma once
 
+#include <condition_variable>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 // Header files, Qt.
 #if defined ASSIMP_QT4_VIEWER
@@ -60,6 +63,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 // Header files, project.
 #include "glview.hpp"
+#include "raytracingglview.hpp"
 #include "loggerview.hpp"
 #include "AssimpOptixRayTracer.hpp"
 
@@ -137,7 +141,7 @@ private slots:
 private:
     Ui::MainWindow *ui;
     CGLView *mGLView;///< Pointer to OpenGL render.
-    CGLView *mGLView_rayTraced;///< Pointer to OpenGL render for OptiX.
+    manojr::CRayTracingGLView *mGLView_rayTraced;///< Pointer to OpenGL render for OptiX.
     CLoggerView *mLoggerView;///< Pointer to logging object.
     Assimp::Importer mImporter;///< Assimp importer.
     const aiScene* mScene;///< Pointer to loaded scene (\ref aiScene).
@@ -154,7 +158,21 @@ private:
 		bool Scene_Rotated;
     } mMouse_Transformation;
 
+	// -- manojr -- RAY TRACING
+	// Needs to run in a separate thread because all calls to OptiX API must come from one thread.
+	// Because this is a GUI application, the main thread and GUI thread are separate.
+	// The main thread runs initialization code while the GUI thread runs code to update results.
+	// Without a common thread to collect both, OptiX API calls will be split across the main and GUI threads.
+	std::thread mRayTracingThread;
 	manojr::AssimpOptixRayTracer mAssimpOptixRayTracer;
-};
 
-std::unique_ptr<MainWindow> makeMainWindow();
+	std::mutex mRayTracingCommandMutex;
+	std::condition_variable mRayTracingCommandConditionVariable;
+	int mRayTracingCommand; // 0 = noop, -1 = quit, 1 = rayTrace, 2 = new scene
+
+	// Ray-tracing result: point-cloud (scene).
+	// Ray-tracing thread must write to this but the GUI must also read from this in order to render.
+	std::mutex mRayTracingResultMutex;
+	// Unlike mScene, which is owned by the AssImp importer, this result aiScene must be explicitly destroyed.
+	std::unique_ptr<aiScene> mRayTracingResult;
+};

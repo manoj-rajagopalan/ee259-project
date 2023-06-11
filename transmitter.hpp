@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-#include "float3.hpp"
+//- #include "float3.hpp"
 
 namespace manojr
 {
@@ -22,6 +22,7 @@ struct Transmitter
 
     float width; // m, distributed symmetrically about x-axis
     float height; // m, distributed symmetrically about y-axis
+    float focalLength; // m, distance of focal plane from local origin (along -z axis)
 
     // Rays distributed equally about 0, for x- and y-axes
     int32_t numRays_x;

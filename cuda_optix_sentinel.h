@@ -23,13 +23,13 @@
 #include <sstream>
 #include <stdexcept>
 
-#define CUDA_CHECK(call)						                    \
+#define CUDA_CHECK(call)						                                    \
     do {									                                              \
-      cudaError_t res = cuda##call;                                      \
-      if (res != cudaSuccess) {                                          \
-        std::stringstream txt;                                          \
+      cudaError_t res = cuda##call;                                     \
+      if (res != cudaSuccess) {                                         \
+        std::ostringstream txt;                                          \
         txt << "cuda" << #call << " error #" << res                     \
-            << " (" << cudaGetErrorName(res) << ')'                      \
+            << " (" << cudaGetErrorName(res) << ')'                     \
             << " at " << __FILE__ << ':' << __LINE__ << " : "           \
             << cudaGetErrorString(res);                                 \
         throw std::runtime_error(txt.str());                            \
@@ -46,26 +46,26 @@
     OptixResult res = call;                                             \
     if( res != OPTIX_SUCCESS )                                          \
       {                                                                 \
-        std::stringstream txt;                                          \
+        std::ostringstream txt;                                         \
         txt << #call << " error #" << res                               \
-            << " (" << optixGetErrorName(res) << ')'                     \
+            << " (" << optixGetErrorName(res) << ')'                    \
             << " at " << __FILE__ << ':' << __LINE__ << " : "           \
             << optixGetErrorString(res);                                \
-        throw std::runtime_error(s.str());                              \
+        throw std::runtime_error(txt.str());                            \
       }                                                                 \
   } while(false)
 
-#define CUDA_STREAM_SYNC_CHECK() \
-  do { \
-    cudaStreamSynchronize(); \
-    cudaError_t const res = cudaGetLastError(); \
-    if( res != OPTIX_SUCCESS )                                          \
+#define CUDA_STREAM_SYNC_CHECK( cudaStream )                            \
+  do {                                                                  \
+    cudaStreamSynchronize(cudaStream);                                  \
+    cudaError_t const res = cudaGetLastError();                         \
+    if( res != cudaSuccess )                                           \
       {                                                                 \
-        std::stringstream txt;                                          \
+        std::ostringstream txt;                                         \
         txt << " CUDA Error upon stream-sync #" << res                  \
-            << " (" << optixGetErrorName(res) << ')'                     \
+            << " (" << cudaGetErrorName(res) << ')'                     \
             << " at " << __FILE__ << ':' << __LINE__ << " : "           \
-            << optixGetErrorString(res);                                \
-        throw std::runtime_error(s.str());                              \
+            << cudaGetErrorString(res);                                 \
+        throw std::runtime_error(txt.str());                            \
       }                                                                 \
   } while(false)

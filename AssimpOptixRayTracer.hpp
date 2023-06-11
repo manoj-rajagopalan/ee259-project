@@ -1,10 +1,16 @@
-#include <array>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
+#include <mutex>
 #include <string>
 
 #include <cuda_runtime.h>
 
-#include "CUDABuffer.h"
+#include "assimp/scene.h"
+#include "assimp/matrix4x4.h"
+
+#include "AsyncCudaBuffer.hpp"
+#include "ExecutionCursor.hpp"
 #include "transmitter.hpp"
 
 namespace manojr {
@@ -12,19 +18,29 @@ namespace manojr {
 class AssimpOptixRayTracer
 {
   public:
-    AssimpOptixRayTracer(std::function<void(std::string const&)> logInfo,
-                         std::function<void(std::string const&)> logError);
+    AssimpOptixRayTracer(std::mutex& rayTracingMutex,
+	                       std::condition_variable& rayTracingConditionVariable,
+							           int& rayTracingCommand);
     ~AssimpOptixRayTracer();
 
-    void setScene(aiScene const& scene);
-    void setSceneTransform(aiMatrix4D& modelToWorldTransform);
-    
-    void setTransmitter(manojr::Transmitter const& transmitter) {
-      transmitter_ = transmitter;
-    }
-    void setTransmitterTransform(aiMatrix4D const& transmitterToWorldTransform);
+    /// @brief Call before doing anything else.
+    void registerLoggingFunctions(std::function<void(std::string const&)> logInfo,
+                                  std::function<void(std::string const&)> logError);
 
-    aiScene runRayTracing();
+    void initialize(); ///< CUDA and OptiX. Call after setting logging functions.
+
+    void setScene(aiScene const& scene);
+    void setSceneTransform(aiMatrix4x4 const& modelToWorldTransform);
+    
+    void setTransmitter(Transmitter const& transmitter);
+    void setTransmitterTransform(aiMatrix4x4 const& transmitterToWorldTransform /* 3x3 rotation matrix only! */);
+
+    /// Caller takes ownership of result.
+    aiScene* runRayTracing();
+
+    void eventLoop();
+
+    void logOptixMessage(unsigned int level, const char *tag, const char *msg);
 
   private:
 
@@ -57,26 +73,31 @@ class AssimpOptixRayTracer
                                  ExecutionCursor whereInProgram);
       void buildOptixPipeline_(ExecutionCursor whereInProgram);
       
-      CUdeviceptr makeRaygenSbtRecord_(ExecutionCursor whereInProgram);
-      std::pair<CUdeviceptr, unsigned int> makeMissSbtRecord_(ExecutionCursor whereInProgram);
-      std::pair<CUdeviceptr, unsigned int> makeHitGroupSbtRecord_(ExecutionCursor whereInProgram);
+      void* makeRaygenSbtRecord_(ExecutionCursor whereInProgram);
+      std::pair<void*, unsigned int> makeMissSbtRecord_(ExecutionCursor whereInProgram);
+      std::pair<void*, unsigned int> makeHitGroupSbtRecord_(ExecutionCursor whereInProgram);
       void makeOptixShaderBindingTable_(ExecutionCursor whereInProgram);
+
+      // Multi-threaded communication with parent
+      std::mutex& rayTracingMutex_;
+      std::condition_variable& rayTracingConditionVariable_;
+      int& rayTracingCommand_;
 
       // Callback functors which abstract the output streams for logging.
       std::function<void(std::string const&)> logInfo_;
       std::function<void(std::string const&)> logError_;
-      
+    
       int executionFrame_;
 
       // Scene data
-      osc::CUDABuffer modelVertexBufferOnGpu_;
-      osc::CUDABuffer worldVertexBufferOnGpu_;
-      osc::CUDABuffer indexBufferOnGpu_;
-      osc::CUDABuffer rayHitVerticesOnGpu_; // world coords
+      AsyncCudaBuffer modelVertexBufferOnGpu_;
+      AsyncCudaBuffer worldVertexBufferOnGpu_;
+      AsyncCudaBuffer indexBufferOnGpu_;
+      AsyncCudaBuffer rayHitVerticesOnGpu_; // world coords
 
       // Transmitter data
-      manojr::Transmitter transmitter_;
-      aiMatrix4D transmitterToWorldTransform_;
+      Transmitter transmitter_;
+      aiMatrix4x4 transmitterToWorldTransform_;
 
       // CUDA data
       CUcontext cuCtx_ = 0;
@@ -87,7 +108,7 @@ class AssimpOptixRayTracer
 
       // OptiX geometry acceleration structures (mesh + BVH etc.)
       OptixTraversableHandle gasHandle_;
-      osc::CUDABuffer gasBuild_;
+      AsyncCudaBuffer gasBuild_;
 
       // OptiX ray-tracing code structures
       OptixModule optixModule_;
@@ -100,3 +121,5 @@ class AssimpOptixRayTracer
       OptixShaderBindingTable optixSbt_;
 
 }; // class AssimpOptixRayTracer
+
+} // namespace manojr

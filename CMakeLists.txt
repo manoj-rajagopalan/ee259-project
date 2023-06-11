@@ -1,17 +1,26 @@
 project(ee259 LANGUAGES CXX CUDA)
 cmake_minimum_required(VERSION 3.1)
 
+SET(CMAKE_CUDA_STANDARD 17)
+SET(CMAKE_CUDA_STANDARD_REQUIRED ON)
+SET(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -std=c++17 --compiler-bindir /usr/bin/g++-10") # compile error without this!
+
 FIND_PACKAGE(OpenGL QUIET)
 FIND_PACKAGE(Qt5 COMPONENTS Gui Widgets OpenGL QUIET)
 
 SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
+
+# https://github.com/NVlabs/instant-ngp/issues/119
+# TL;DR using g++ v10 (instead of 11) prevents a nvcc error with std::function<> when g++==11.x
+SET(CMAKE_CXX_COMPILER "/usr/bin/g++-10")
+SET(CMAKE_C_COMPILER "/usr/bin/gcc-10")
 
 SET(ee259_SRCS
     main.cpp
     mainwindow.hpp
     mainwindow.cpp
     AssimpOptixRayTracer.hpp
-    AssimpOptixRayTracer.cpp
+    AssimpOptixRayTracer.cu
     transmitter.hpp
     glview.hpp
     glview.cpp
@@ -20,8 +29,8 @@ SET(ee259_SRCS
     ExecutionCursor.hpp
     RaiiScopeLimitsLogger.hpp
     LaunchParams.hpp
-    cuda_optix_sentinel.h
-    float3.hpp)
+    AsyncCudaBuffer.hpp
+    cuda_optix_sentinel.h)
 
 INCLUDE_DIRECTORIES(/home/rmanoj/Software/NVIDIA-OptiX-SDK-7.7.0-linux64-x86_64/include)
 INCLUDE_DIRECTORIES(${CMAKE_SOURCE_DIR}/3rdparty)
@@ -36,6 +45,9 @@ set_target_properties(ee259 PROPERTIES AUTOMOC ON)
 set_target_properties(ee259 PROPERTIES AUTOUIC ON)
 
 set_target_properties(ee259 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# https://cmake.org/cmake/help/v3.22/prop_tgt/CUDA_ARCHITECTURES.html
+set_target_properties(ee259 PROPERTIES CUDA_ARCHITECTURES "75")
 
 target_link_libraries(ee259
                       Qt5::Gui

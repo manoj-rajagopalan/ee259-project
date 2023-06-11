@@ -1,10 +1,10 @@
 #pragma once
 
 #include <cmath>
-#include "assimp/vector3.h"
 
 // https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html#compilation-phases
 #ifndef __CUDACC__
+#include "assimp/vector3.h"
 typedef aiVector3t<float> float3;
 #endif
 
