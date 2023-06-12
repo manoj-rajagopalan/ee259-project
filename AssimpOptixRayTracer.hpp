@@ -120,6 +120,7 @@ class AssimpOptixRayTracer : public QObject
 
     aiScene const *scene_;
     aiMatrix4x4 const *modelToWorldTransform_;
+    std::unique_ptr<AsyncCudaBuffer> modelToWorldTransformOnGpu_;
     Transmitter const *transmitter_;
 
     std::mutex& resultMutex_;
@@ -152,6 +153,8 @@ class AssimpOptixRayTracer : public QObject
     OptixTraversableHandle gasHandle_;
     std::unique_ptr<AsyncCudaBuffer> gasBuild_;
 
+    std::unique_ptr<AsyncCudaBuffer> launchParamsOnGpu_;
+    
     // OptiX ray-tracing code structures
     OptixModule optixModule_;
     OptixPipeline optixPipeline_;

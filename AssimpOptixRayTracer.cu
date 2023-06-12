@@ -101,11 +101,15 @@ void AssimpOptixRayTracer::initialize_(ExecutionCursor whereInProgram)
     RaiiScopeLimitsLogger scopeLog(logInfo_, whereInProgram, __func__);
     
     initializeCuda_(whereInProgram.advance());
+    modelToWorldTransformOnGpu_.reset(new AsyncCudaBuffer(cudaStream_));
+    modelToWorldTransformOnGpu_->asyncResize(12 * sizeof(float)); // 3x4 matrix of float
     modelVertexBufferOnGpu_.reset(new AsyncCudaBuffer(cudaStream_));
     worldVertexBufferOnGpu_.reset(new AsyncCudaBuffer(cudaStream_));
     indexBufferOnGpu_.reset(new AsyncCudaBuffer(cudaStream_));
     rayHitVerticesOnGpu_.reset(new AsyncCudaBuffer(cudaStream_));
     gasBuild_.reset(new AsyncCudaBuffer(cudaStream_));
+    launchParamsOnGpu_.reset(new AsyncCudaBuffer(cudaStream_));
+    launchParamsOnGpu_->asyncResize(sizeof(OptixLaunchParams));
 
     initializeOptix_(whereInProgram.advance());
 
@@ -148,8 +152,9 @@ void AssimpOptixRayTracer::initializeCuda_(ExecutionCursor whereInProgram)
         logInfo_('[' + whereInProgram.toString() + "] "
                  + std::string("CUDA device name is ") + cudaDeviceProps.name);
 
-        CUDA_CHECK( SetDevice(cudaDevice) );
-        CUDA_CHECK( StreamCreate(&cudaStream_) );
+        // CUDA_CHECK( SetDevice(cudaDevice) );
+        // CUDA_CHECK( StreamCreate(&cudaStream_) );
+        cudaStream_ = 0;
     }
     catch(std::exception& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -160,7 +165,7 @@ void AssimpOptixRayTracer::finalizeCuda_(ExecutionCursor whereInProgram)
 {
     RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
     try {
-        CUDA_CHECK( StreamDestroy(cudaStream_) );
+        // CUDA_CHECK( StreamDestroy(cudaStream_) );
     }
     catch(std::exception& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -249,17 +254,17 @@ void AssimpOptixRayTracer::processSceneTransform_(ExecutionCursor whereInProgram
 {
     RaiiScopeLimitsLogger raiiScopeLogger(logInfo_, whereInProgram, __func__);
     try {
-        AsyncCudaBuffer modelToWorldTransformOnGpu{cudaStream_};
-        modelToWorldTransformOnGpu.asyncAllocAndUpload((float const*) modelToWorldTransform_, 12);
+        modelToWorldTransformOnGpu_->asyncUpload((float const*) modelToWorldTransform_, 12);
         // 8 block with 32 threads each
         int const kNumThreadsPerBlock = 32;
         // TODO: large meshes can exceed CUDA limits
         int const kNumBlocks = (modelVertexBufferOnGpu_->numElements + kNumThreadsPerBlock-1) / kNumThreadsPerBlock;
-        transformVertexBufferOnGpu<<<kNumBlocks, kNumThreadsPerBlock, 0, cudaStream_>>>(
+        // transformVertexBufferOnGpu<<<kNumBlocks, kNumThreadsPerBlock, 0, cudaStream_>>>(
+        transformVertexBufferOnGpu<<<kNumBlocks, kNumThreadsPerBlock>>>(
             worldVertexBufferOnGpu_->d_pointer(),
             modelVertexBufferOnGpu_->d_pointer(),
             modelVertexBufferOnGpu_->numElements,
-            modelToWorldTransformOnGpu.d_pointer()
+            modelToWorldTransformOnGpu_->d_pointer()
         );
         CUDA_CHECK( GetLastError() );
 
@@ -300,26 +305,26 @@ void AssimpOptixRayTracer::runRayTracing_(ExecutionCursor whereInProgram)
     try {
         OptixLaunchParams launchParams{};
         {
-            launchParams.pointCloud = (void*) rayHitVerticesOnGpu_->d_pointer();
+            launchParams.pointCloud = rayHitVerticesOnGpu_->d_pointer();
             launchParams.gasHandle = gasHandle_;
             launchParams.gpuAtomicNumHits = 0;
             std::unique_lock<std::mutex> lock(commandMutex_);
             launchParams.transmitter = *transmitter_;
         }
-        AsyncCudaBuffer launchParamsOnGpu{cudaStream_};
-        launchParamsOnGpu.asyncAllocAndUpload(&launchParams, 1);
+        launchParamsOnGpu_->asyncUpload(&launchParams, 1);
         OPTIX_CHECK(
             optixLaunch(optixPipeline_,
                         cudaStream_,
-                        (CUdeviceptr) launchParamsOnGpu.d_pointer(),
-                        launchParamsOnGpu.sizeInBytes,
+                        (CUdeviceptr) launchParamsOnGpu_->d_pointer(),
+                        launchParamsOnGpu_->sizeInBytes,
                         &optixSbt_,
                         launchParams.transmitter.numRays_x,
                         launchParams.transmitter.numRays_y,
                         1)
         );
-        launchParamsOnGpu.asyncDownload(&launchParams, 1);
-        launchParamsOnGpu.sync(); // Ensure download completes before accessing results.
+        CUDA_STREAM_SYNC_CHECK(cudaStream_);
+        launchParamsOnGpu_->asyncDownload(&launchParams, 1);
+        launchParamsOnGpu_->sync(); // Ensure download completes before accessing results.
         rayHitVerticesOnGpu_->numElements = launchParams.gpuAtomicNumHits;
         
         aiMesh *const pointCloudMesh = new aiMesh;
@@ -436,6 +441,7 @@ void AssimpOptixRayTracer::buildOptixAccelerationStructures_(ExecutionCursor whe
                         nullptr, 0 // emitted properties
                         );
     );
+    CUDA_STREAM_SYNC_CHECK(cudaStream_); // Otherwise gasBuildTemp will be destroyed and its d_pointer lost.
 }
 
 std::string AssimpOptixRayTracer::loadOptixModuleSourceCode_(ExecutionCursor whereInProgram)
@@ -490,6 +496,8 @@ void AssimpOptixRayTracer::makeOptixModule_(OptixPipelineCompileOptions optixPip
                               logBuffer, &logBufferSize,
                               &optixModule_)
         );
+        logBuffer[logBufferSize] = '\0';
+        logInfo_('[' + whereInProgram.toString() + "] " + (char*) logBuffer);
     }
     catch(std::exception const& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
