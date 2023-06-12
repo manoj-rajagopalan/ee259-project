@@ -24,6 +24,7 @@ SET(ee259_SRCS
     transmitter.hpp
     glview.hpp
     glview.cpp
+    raytracingglview.hpp
     loggerview.hpp
     loggerview.cpp
     ExecutionCursor.hpp

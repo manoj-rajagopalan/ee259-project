@@ -18,8 +18,8 @@ class CRayTracingGLView : public CGLView
     {}
 
   private:
-    // Protect shared scene while rendering it from a different (GUI) thread.
     void paintGL() override {
+        // Protect shared scene while rendering it from a different (GUI) thread.
         std::unique_lock<std::mutex> lock(sharedSceneMutex_);
         CGLView::paintGL();
     }

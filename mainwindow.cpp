@@ -56,20 +56,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 using namespace Assimp;
 
-// manojr
-namespace {
-
-// a = b (compiler requires '=' operator to be non-static member function but target types is a CUDA typedef)
-inline
-void set(float3& a, const aiVector3D& b)
-{
-	a.x = b[0];
-	a.y = b[1];
-	a.z = b[2];
-}
-
-}
-
 void MainWindow::ImportFile(const QString &pFileName) {
     QTime time_begin = QTime::currentTime();
 
@@ -135,49 +121,30 @@ void MainWindow::ImportFile(const QString &pFileName) {
 
 		// -- manojr -- Perform ray-tracing and visualize the point-cloud
 
-		{
-			std::scoped_lock<std::mutex> rayTracingCommandLock(mRayTracingCommandMutex);
-			mRayTracingCommand = 2; // new scene
-			mRayTracingCommandConditionVariable.notify_one();
-		}
-		// TODO - these should go away after AssimpOptixRayTracer eventLoop
-		mAssimpOptixRayTracer.setScene(*mScene);
-		// Identity transform: copies model vertex buffer into world vertex buffer
-        // and also, importantly, builds all the OptiX geometry acceleration structures.
-        aiMatrix4x4 const identityTransform{};
-        mAssimpOptixRayTracer.setSceneTransform(identityTransform);
+		// Initialize transmitter
+		transmitter_.position[0] = cameraPosition[0];
+		transmitter_.position[1] = cameraPosition[1];
+		transmitter_.position[2] = cameraPosition[2];
+		transmitter_.width = 1.0f;
+		transmitter_.height = 1.0f;
+		transmitter_.focalLength = 1.0f;
+		transmitter_.numRays_x = 30;
+		transmitter_.numRays_y = 30;
 
-
-		{ // Set transmitter.
-			// Extract camera params to co-locate transmitter with.
-			aiMatrix4x4 rotationScene; // not used
-			aiMatrix4x4 worldToCamera; // rows represent camera axes in world coords
-			aiVector3D cameraPosition;
-			mGLView->Camera_Matrix(worldToCamera, rotationScene, cameraPosition);
-
-			manojr::Transmitter transmitter;
-			{
-				set(transmitter.position, cameraPosition);
-				// unit-vectors set below
-				transmitter.width = 1.0f;
-				transmitter.height = 1.0f;
-				transmitter.focalLength = 1.0f;
-				transmitter.numRays_x = 30;
-				transmitter.numRays_y = 30;
-			}
-			mAssimpOptixRayTracer.setTransmitter(transmitter);
-			mAssimpOptixRayTracer.setTransmitterTransform(worldToCamera.Transpose() /*modified!*/);
-		}
-
-		std::unique_lock<std::mutex> rayTracingResultLock(mRayTracingResultMutex);
-		aiScene *const rayTracingResultPointCloud = mAssimpOptixRayTracer.runRayTracing();
-		mRayTracingResult.reset(rayTracingResultPointCloud);
-		mGLView_rayTraced->SetScene(rayTracingResultPointCloud, QString{});
-#if ASSIMP_QT4_VIEWER
-		mGLView_rayTraced->updateGL();
-#else
-		mGLView_rayTraced->update();
-#endif // ASSIMP_QT4_VIEWER
+		// Co-locate transmitter with camera
+		aiMatrix4x4 cameraToWorld; // rows represent camera axes in world coords
+		aiVector3D cameraPosition;
+		mGLView->Camera_Matrix(/*transpose of*/ cameraToWorld, mSceneToWorldRotation, cameraPosition);
+		cameraToWorld.Transpose();
+		updateTransmitterPose_(cameraToWorld);
+	
+		std::unique_lock<std::mutex> rayTracingCommandLock(mRayTracingCommandMutex);		
+		mAssimpOptixRayTracer.setScene(mScene);
+        mAssimpOptixRayTracer.setSceneTransform(&mSceneToWorldRotation);
+		mAssimpOptixRayTracer.setTransmitter(&transmitter_);
+		mAssimpOptixRayTracer.setTransmitterTransform();
+		mRayTracingCommandConditionVariable.notify_one();
+		rayTracingCommandLock.unlock();
 	}
 	else
 	{
@@ -189,6 +156,21 @@ void MainWindow::ImportFile(const QString &pFileName) {
 	}// if(mScene != nullptr)
 }
 
+void MainWindow::updateTransmitterPose_(aiMatrix4x4 const& cameraToWorld)
+{
+	transmitter_.xUnitVector.x = cameraToWorld[0][0];
+	transmitter_.xUnitVector.y = cameraToWorld[1][0];
+	transmitter_.xUnitVector.z = cameraToWorld[2][0];
+	
+	transmitter_.yUnitVector.x = cameraToWorld[0][1];
+	transmitter_.yUnitVector.y = cameraToWorld[1][1];
+	transmitter_.yUnitVector.z = cameraToWorld[2][1];
+	
+	transmitter_.zUnitVector.x = cameraToWorld[0][2];
+	transmitter_.zUnitVector.y = cameraToWorld[1][2];
+	transmitter_.zUnitVector.z = cameraToWorld[2][2];
+
+}
 void MainWindow::ResetSceneInfos()
 {
 	ui->lblLoadTime->clear();
@@ -253,26 +235,41 @@ void MainWindow::mouseReleaseEvent(QMouseEvent *pEvent)
 {
 	if(pEvent->buttons() == 0) {
 		mMouse_Transformation.Position_Pressed_Valid = false;
-		aiMatrix4x4 sceneRotation, worldToCamera;
+		aiMatrix4x4 cameraToWorldRotation;
 		aiVector3D cameraTranslation;
-		mGLView->Camera_Matrix(worldToCamera, sceneRotation, cameraTranslation);
+		mGLView->Camera_Matrix(/*transpose of*/ cameraToWorldRotation, mSceneToWorldRotation, cameraTranslation);
+		cameraToWorldRotation.Transpose(); // all good now
+
+		// Trigger ray-tracing.
+		std::unique_lock<std::mutex> rayTracingCommandMutexLock(mRayTracingCommandMutex);
 		if(mMouse_Transformation.Scene_Rotated) {
-			mAssimpOptixRayTracer.setSceneTransform(sceneRotation);
+			mAssimpOptixRayTracer.setSceneTransform(&mSceneToWorldRotation);
 			mMouse_Transformation.Scene_Rotated = false;
 		}
 		if(mMouse_Transformation.Camera_Rotated) {
-			mAssimpOptixRayTracer.setTransmitterTransform(worldToCamera.Transpose() /*modified!*/);
+			updateTransmitterPose_(cameraToWorldRotation);
+			mAssimpOptixRayTracer.setTransmitterTransform();
 			mMouse_Transformation.Camera_Rotated = false;
 		}
-		aiScene const *const rayPointCloud = mAssimpOptixRayTracer.runRayTracing();
-		mGLView_rayTraced->SetScene(rayPointCloud, QString()); // Pointer ownership transferred.
+		rayTracingCommandMutexLock.unlock();
+		mRayTracingCommandConditionVariable.notify_one();
+	}
+
+}
+
+void MainWindow::renderRayTracedPointCloud()
+{
+	// TODO - does ray-tracing result creation lock result-mutex?
+
+	std::unique_lock<std::mutex> lock(mRayTracingResultMutex);
+	aiScene const *const rayTracedPointCloud = mAssimpOptixRayTracer.rayRacingResult(); // Ownership transfer
+	mRayTracingResult.reset(rayTracedPointCloud); // Ownership transfer
+	mGLView_rayTraced->SetScene(rayTracedPointCloud, QString());
 	#if ASSIMP_QT4_VIEWER
 			mGLView_rayTraced->updateGL();
 	#else
 			mGLView_rayTraced->update();
 	#endif // ASSIMP_QT4_VIEWER
-	}
-
 }
 
 void MainWindow::mouseMoveEvent(QMouseEvent* pEvent)
@@ -358,9 +355,9 @@ MainWindow::MainWindow(QWidget *parent)
 	: QMainWindow(parent),
 	  ui(new Ui::MainWindow),
 	  mScene(nullptr),
-	  mAssimpOptixRayTracer(rayTracingMutex,
-	                        rayTracingConditionVariable,
-							rayTracingCommand)
+	  mAssimpOptixRayTracer(mRayTracingCommandMutex,
+	                        mRayTracingCommandConditionVariable,
+							mRayTracingResultMutex)
 {
 
 	// other variables
@@ -403,7 +400,7 @@ MainWindow::MainWindow(QWidget *parent)
 	std::function<void(std::string const&)> infoToCout = [](std::string const& s) { std::cout << s << std::endl; };
 	std::function<void(std::string const&)> errToCerr = [](std::string const& s) { std::cerr << s << std::endl; };
 	mAssimpOptixRayTracer.registerLoggingFunctions(infoToCout, errToCerr);
-	mRayTracingCommand = 0; // noop
+	connect(mAssimpOptixRayTracer, SIGNAL(rayTracingComplete(), this, SLOT(renderRayTracedPointCloud()));
 	mRayTracingThread = std::thread([&]() { mAssimpOptixRayTracer.eventLoop(); });	
 }
 
@@ -588,4 +585,11 @@ void MainWindow::on_cbxTextures_clicked(bool checked)
 {
 	mGLView->Enable_Textures(checked);
 	mGLView->update();
+}
+
+void MainWindow::closeEvent(QCloseEvent *e)
+{
+	std::unique_lock<std::mutex> lock(mRayTracingCommandMutex);
+	mAssimpOptixRayTracer.quit();
+	e->accept();
 }

@@ -62,10 +62,12 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <optix.h>
 
 // Header files, project.
+#include "transmitter.hpp"
+#include "AssimpOptixRayTracer.hpp"
+
 #include "glview.hpp"
 #include "raytracingglview.hpp"
 #include "loggerview.hpp"
-#include "AssimpOptixRayTracer.hpp"
 
 namespace Ui { 
     class MainWindow; 
@@ -138,13 +140,21 @@ private slots:
 	void on_cbxTextures_clicked(bool checked);
 	void on_cbxDrawAxes_clicked(bool checked);
 
+	// -manojr-
+	void renderRayTracedPointCloud();
+
 private:
+	void closeEvent(QCloseEvent *) override;
+	void updateTransmitterPose_(aiMatrix4x4 const& cameraToWorld);
+
     Ui::MainWindow *ui;
     CGLView *mGLView;///< Pointer to OpenGL render.
     manojr::CRayTracingGLView *mGLView_rayTraced;///< Pointer to OpenGL render for OptiX.
     CLoggerView *mLoggerView;///< Pointer to logging object.
     Assimp::Importer mImporter;///< Assimp importer.
     const aiScene* mScene;///< Pointer to loaded scene (\ref aiScene).
+	aiMatrix4x4 mSceneToWorldRotation;
+	manojr::Transmitter transmitter_;
 
     /// \struct SMouse_Transformation
     /// Holds data about transformation of the scene/camera when mouse us used.
@@ -163,16 +173,16 @@ private:
 	// Because this is a GUI application, the main thread and GUI thread are separate.
 	// The main thread runs initialization code while the GUI thread runs code to update results.
 	// Without a common thread to collect both, OptiX API calls will be split across the main and GUI threads.
-	std::thread mRayTracingThread;
-	manojr::AssimpOptixRayTracer mAssimpOptixRayTracer;
 
 	std::mutex mRayTracingCommandMutex;
 	std::condition_variable mRayTracingCommandConditionVariable;
-	int mRayTracingCommand; // 0 = noop, -1 = quit, 1 = rayTrace, 2 = new scene
 
 	// Ray-tracing result: point-cloud (scene).
 	// Ray-tracing thread must write to this but the GUI must also read from this in order to render.
 	std::mutex mRayTracingResultMutex;
 	// Unlike mScene, which is owned by the AssImp importer, this result aiScene must be explicitly destroyed.
 	std::unique_ptr<aiScene> mRayTracingResult;
+
+	std::thread mRayTracingThread;
+	manojr::AssimpOptixRayTracer mAssimpOptixRayTracer;
 };
