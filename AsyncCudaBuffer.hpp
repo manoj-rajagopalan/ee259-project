@@ -13,7 +13,8 @@ namespace manojr {
     AsyncCudaBuffer() = delete;
 
     explicit AsyncCudaBuffer(cudaStream_t cudaStream) {
-      this->cudaStream = cudaStream;
+      // this->cudaStream = cudaStream;
+      this->cudaStream = 0; // default stream
     }
 
     AsyncCudaBuffer(const AsyncCudaBuffer&) = delete; // non-copyable
@@ -42,13 +43,15 @@ namespace manojr {
     {
       assert(d_ptr == nullptr);
       this->sizeInBytes = sizeInBytes;
-      CUDA_CHECK( MallocAsync( (void**)&d_ptr, sizeInBytes, cudaStream) );
+      // CUDA_CHECK( MallocAsync( (void**)&d_ptr, sizeInBytes, cudaStream) );
+      CUDA_CHECK( Malloc( (void**)&d_ptr, sizeInBytes) );
     }
 
     //! asyncFree allocated memory
     void asyncFree()
     {
-      CUDA_CHECK(FreeAsync(d_ptr, cudaStream));
+      // CUDA_CHECK(FreeAsync(d_ptr, cudaStream));
+      CUDA_CHECK(Free(d_ptr));
       d_ptr = nullptr;
       sizeInBytes = 0;
       numElements = 0;
@@ -69,14 +72,14 @@ namespace manojr {
     template<typename T>
     void asyncAllocAndUpload(const std::vector<T> &vt)
     {
-      asyncAlloc(vt.size()*sizeof(T));
+      asyncResize(vt.size()*sizeof(T));
       asyncUpload((const T*)vt.data(), vt.size());
     }
     
     template<typename T>
     void asyncAllocAndUpload(T const *t, size_t count)
     {
-      asyncAlloc(count*sizeof(T));
+      asyncResize(count*sizeof(T));
       asyncUpload(t, count);
     }
 
@@ -87,11 +90,15 @@ namespace manojr {
       assert(sizeInBytes == count*sizeof(T));
       this->numElements = count;
       this->sizeOfElement = sizeof(T);
-      CUDA_CHECK (MemcpyAsync(d_ptr,
-                              (void *)t,
-                              count*sizeof(T),
-                              cudaMemcpyHostToDevice,
-                              cudaStream));
+      // CUDA_CHECK (MemcpyAsync(d_ptr,
+      //                         (void *)t,
+      //                         count*sizeof(T),
+      //                         cudaMemcpyHostToDevice,
+      //                         cudaStream));
+      CUDA_CHECK (Memcpy(d_ptr,
+                        (void *)t,
+                        count*sizeof(T),
+                        cudaMemcpyHostToDevice));
     }
     
     template<typename T>
@@ -101,11 +108,15 @@ namespace manojr {
       assert(numElements >= count);
       assert(sizeOfElement == sizeof(T));
       assert(sizeInBytes >= count*sizeof(T));
-      CUDA_CHECK( MemcpyAsync((void *)t,
-                              d_ptr,
-                              count*sizeof(T),
-                              cudaMemcpyDeviceToHost,
-                              cudaStream));
+      // CUDA_CHECK( MemcpyAsync((void *)t,
+      //                         d_ptr,
+      //                         count*sizeof(T),
+      //                         cudaMemcpyDeviceToHost,
+      //                         cudaStream));
+      CUDA_CHECK( Memcpy((void *)t,
+                          d_ptr,
+                          count*sizeof(T),
+                          cudaMemcpyDeviceToHost));
     }
     
     template<typename T>
@@ -117,7 +128,8 @@ namespace manojr {
 
     void sync()
     {
-      CUDA_STREAM_SYNC_CHECK(cudaStream);
+      // CUDA_STREAM_SYNC_CHECK(cudaStream);
+      CUDA_CHECK( DeviceSynchronize() );
     }
 
     cudaStream_t cudaStream;
