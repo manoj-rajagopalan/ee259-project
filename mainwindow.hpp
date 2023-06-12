@@ -145,7 +145,8 @@ private slots:
 
 private:
 	void closeEvent(QCloseEvent *) override;
-	void updateTransmitterPose_(aiMatrix4x4 const& cameraToWorld);
+	static void UpdateTransmitterPose_(manojr::Transmitter& transmitter,
+	                                   aiMatrix4x4 const& cameraToWorld);
 
     Ui::MainWindow *ui;
     CGLView *mGLView;///< Pointer to OpenGL render.
@@ -181,7 +182,7 @@ private:
 	// Ray-tracing thread must write to this but the GUI must also read from this in order to render.
 	std::mutex mRayTracingResultMutex;
 	// Unlike mScene, which is owned by the AssImp importer, this result aiScene must be explicitly destroyed.
-	std::unique_ptr<aiScene> mRayTracingResult;
+	std::unique_ptr<aiScene const> mRayTracingResult;
 
 	std::thread mRayTracingThread;
 	manojr::AssimpOptixRayTracer mAssimpOptixRayTracer;

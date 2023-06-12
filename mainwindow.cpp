@@ -122,29 +122,28 @@ void MainWindow::ImportFile(const QString &pFileName) {
 		// -- manojr -- Perform ray-tracing and visualize the point-cloud
 
 		// Initialize transmitter
-		transmitter_.position[0] = cameraPosition[0];
-		transmitter_.position[1] = cameraPosition[1];
-		transmitter_.position[2] = cameraPosition[2];
+		aiMatrix4x4 cameraToWorld; // rows represent camera axes in world coords
+		aiVector3D cameraPosition;
+		mGLView->Camera_Matrix(/*transpose of*/ cameraToWorld, mSceneToWorldRotation, cameraPosition);
+		cameraToWorld.Transpose();
+		// Co-locate transmitter with camera
+		transmitter_.position.x = cameraPosition[0];
+		transmitter_.position.y = cameraPosition[1];
+		transmitter_.position.z = cameraPosition[2];
+		UpdateTransmitterPose_(transmitter_, cameraToWorld);
 		transmitter_.width = 1.0f;
 		transmitter_.height = 1.0f;
 		transmitter_.focalLength = 1.0f;
 		transmitter_.numRays_x = 30;
 		transmitter_.numRays_y = 30;
-
-		// Co-locate transmitter with camera
-		aiMatrix4x4 cameraToWorld; // rows represent camera axes in world coords
-		aiVector3D cameraPosition;
-		mGLView->Camera_Matrix(/*transpose of*/ cameraToWorld, mSceneToWorldRotation, cameraPosition);
-		cameraToWorld.Transpose();
-		updateTransmitterPose_(cameraToWorld);
 	
 		std::unique_lock<std::mutex> rayTracingCommandLock(mRayTracingCommandMutex);		
 		mAssimpOptixRayTracer.setScene(mScene);
         mAssimpOptixRayTracer.setSceneTransform(&mSceneToWorldRotation);
 		mAssimpOptixRayTracer.setTransmitter(&transmitter_);
 		mAssimpOptixRayTracer.setTransmitterTransform();
-		mRayTracingCommandConditionVariable.notify_one();
 		rayTracingCommandLock.unlock();
+		mRayTracingCommandConditionVariable.notify_one();
 	}
 	else
 	{
@@ -156,21 +155,22 @@ void MainWindow::ImportFile(const QString &pFileName) {
 	}// if(mScene != nullptr)
 }
 
-void MainWindow::updateTransmitterPose_(aiMatrix4x4 const& cameraToWorld)
+void MainWindow::UpdateTransmitterPose_(manojr::Transmitter& transmitter,
+                                        aiMatrix4x4 const& cameraToWorld)
 {
-	transmitter_.xUnitVector.x = cameraToWorld[0][0];
-	transmitter_.xUnitVector.y = cameraToWorld[1][0];
-	transmitter_.xUnitVector.z = cameraToWorld[2][0];
+	transmitter.xUnitVector.x = cameraToWorld[0][0];
+	transmitter.xUnitVector.y = cameraToWorld[1][0];
+	transmitter.xUnitVector.z = cameraToWorld[2][0];
 	
-	transmitter_.yUnitVector.x = cameraToWorld[0][1];
-	transmitter_.yUnitVector.y = cameraToWorld[1][1];
-	transmitter_.yUnitVector.z = cameraToWorld[2][1];
+	transmitter.yUnitVector.x = cameraToWorld[0][1];
+	transmitter.yUnitVector.y = cameraToWorld[1][1];
+	transmitter.yUnitVector.z = cameraToWorld[2][1];
 	
-	transmitter_.zUnitVector.x = cameraToWorld[0][2];
-	transmitter_.zUnitVector.y = cameraToWorld[1][2];
-	transmitter_.zUnitVector.z = cameraToWorld[2][2];
-
+	transmitter.zUnitVector.x = cameraToWorld[0][2];
+	transmitter.zUnitVector.y = cameraToWorld[1][2];
+	transmitter.zUnitVector.z = cameraToWorld[2][2];
 }
+
 void MainWindow::ResetSceneInfos()
 {
 	ui->lblLoadTime->clear();
@@ -247,7 +247,7 @@ void MainWindow::mouseReleaseEvent(QMouseEvent *pEvent)
 			mMouse_Transformation.Scene_Rotated = false;
 		}
 		if(mMouse_Transformation.Camera_Rotated) {
-			updateTransmitterPose_(cameraToWorldRotation);
+			UpdateTransmitterPose_(transmitter_, cameraToWorldRotation);
 			mAssimpOptixRayTracer.setTransmitterTransform();
 			mMouse_Transformation.Camera_Rotated = false;
 		}
@@ -259,17 +259,15 @@ void MainWindow::mouseReleaseEvent(QMouseEvent *pEvent)
 
 void MainWindow::renderRayTracedPointCloud()
 {
-	// TODO - does ray-tracing result creation lock result-mutex?
-
 	std::unique_lock<std::mutex> lock(mRayTracingResultMutex);
-	aiScene const *const rayTracedPointCloud = mAssimpOptixRayTracer.rayRacingResult(); // Ownership transfer
+	aiScene const *const rayTracedPointCloud = mAssimpOptixRayTracer.rayTracingResult(); // Ownership transfer
 	mRayTracingResult.reset(rayTracedPointCloud); // Ownership transfer
 	mGLView_rayTraced->SetScene(rayTracedPointCloud, QString());
-	#if ASSIMP_QT4_VIEWER
-			mGLView_rayTraced->updateGL();
-	#else
-			mGLView_rayTraced->update();
-	#endif // ASSIMP_QT4_VIEWER
+#if ASSIMP_QT4_VIEWER
+	mGLView_rayTraced->updateGL();
+#else
+	mGLView_rayTraced->update();
+#endif // ASSIMP_QT4_VIEWER
 }
 
 void MainWindow::mouseMoveEvent(QMouseEvent* pEvent)
@@ -288,11 +286,11 @@ void MainWindow::mouseMoveEvent(QMouseEvent* pEvent)
 			
 			mMouse_Transformation.Camera_Rotated = true;
 
-	#if ASSIMP_QT4_VIEWER
+#if ASSIMP_QT4_VIEWER
 			mGLView->updateGL();
-	#else
+#else
 			mGLView->update();
-	#endif // ASSIMP_QT4_VIEWER
+#endif // ASSIMP_QT4_VIEWER
 		}
 
 		if(pEvent->buttons() & Qt::RightButton)
@@ -307,11 +305,11 @@ void MainWindow::mouseMoveEvent(QMouseEvent* pEvent)
 
 			mMouse_Transformation.Scene_Rotated = true;
 
-	#if ASSIMP_QT4_VIEWER
+#if ASSIMP_QT4_VIEWER
 			mGLView->updateGL();
-	#else
+#else
 			mGLView->update();
-	#endif // ASSIMP_QT4_VIEWER
+#endif // ASSIMP_QT4_VIEWER
 		}
 	}
 }
@@ -400,17 +398,17 @@ MainWindow::MainWindow(QWidget *parent)
 	std::function<void(std::string const&)> infoToCout = [](std::string const& s) { std::cout << s << std::endl; };
 	std::function<void(std::string const&)> errToCerr = [](std::string const& s) { std::cerr << s << std::endl; };
 	mAssimpOptixRayTracer.registerLoggingFunctions(infoToCout, errToCerr);
-	connect(mAssimpOptixRayTracer, SIGNAL(rayTracingComplete(), this, SLOT(renderRayTracedPointCloud()));
+	connect(&mAssimpOptixRayTracer, SIGNAL(rayTracingComplete()), SLOT(renderRayTracedPointCloud()));
 	mRayTracingThread = std::thread([&]() { mAssimpOptixRayTracer.eventLoop(); });	
 }
 
 MainWindow::~MainWindow()
 {
 	{ // Signal ray-tracing thread to quit
-		LogInfo(tr("Signaled ray-tracing thread to quit."))
-		std::unique_lock<std::mutex> rayTracingLock(mRayTracingMutex);
-		mRayTracingCommand = -1; // quit
-		mRayTracingConditionVariable.notify_one();
+		LogInfo(tr("Signaled ray-tracing thread to quit."));
+		std::unique_lock<std::mutex> lock(mRayTracingCommandMutex);
+		mAssimpOptixRayTracer.quit();
+		mRayTracingCommandConditionVariable.notify_one();
 	}
 	mRayTracingThread.join();
 	LogInfo(tr("Ray-tracing thread has joined."));

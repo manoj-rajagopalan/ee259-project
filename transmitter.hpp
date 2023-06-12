@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include <vector_types.h>
+
 namespace manojr
 {
 

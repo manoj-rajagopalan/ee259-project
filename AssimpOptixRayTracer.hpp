@@ -1,3 +1,5 @@
+#pragma once
+
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -20,10 +22,9 @@ namespace manojr {
 
 class AssimpOptixRayTracer : public QObject
 {
-  public:
-
     Q_OBJECT;
 
+  public:
     AssimpOptixRayTracer(std::mutex& rayTracingCommandMutex,
 	                       std::condition_variable& rayTracingCommandConditionVariable,
                          std::mutex& rayTracingResultMutex);
@@ -35,21 +36,21 @@ class AssimpOptixRayTracer : public QObject
 
     void setScene(aiScene const * scene) {
       scene_ = scene;
-      command_ |= command_t::SET_SCENE;
+      command_ |= COMMAND_SET_SCENE;
     }
     void setSceneTransform(aiMatrix4x4 const *const modelToWorldTransform) {
       modelToWorldTransform_ = modelToWorldTransform;
-      command_ |= command_t::SET_SCENE_TRANSFORM;
+      command_ |= COMMAND_SET_SCENE_TRANSFORM;
     }
     void setTransmitter(Transmitter const *const transmitter) {
       transmitter_ = transmitter;
-      command_ |= command_t::SET_TRANSMITTER;
+      command_ |= COMMAND_SET_TRANSMITTER;
     }
     void setTransmitterTransform() {
-      command_ |= command_t::SET_TRANSMITTER_TRANSFORM;
+      command_ |= COMMAND_SET_TRANSMITTER_TRANSFORM;
     }
 
-    void quit() { command_ |= command_t::QUIT; }
+    void quit() { command_ |= COMMAND_QUIT; }
 
     void eventLoop(); // Run in a separate thread.
     
@@ -59,25 +60,24 @@ class AssimpOptixRayTracer : public QObject
 
     void logOptixMessage(unsigned int level, const char *tag, const char *msg);
 
-  public signals:
+  signals:
     void rayTracingComplete();
 
   private:
 
-    enum class command_t : uint8_t {
-      NONE = 0x0u,
-      SET_SCENE = 0x1u,
-      SET_SCENE_TRANSFORM = 0x1u << 1,
-      SET_TRANSMITTER = 0x1u << 2,
-      SET_TRANSMITTER_TRANSFORM = 0x1u << 3,
-      QUIT = 0x1u << 7
-    };
+    static unsigned int constexpr COMMAND_NONE = 0x0u;
+    static unsigned int constexpr COMMAND_SET_SCENE = 0x1u;
+    static unsigned int constexpr COMMAND_SET_SCENE_TRANSFORM = 0x1u << 1;
+    static unsigned int constexpr COMMAND_SET_TRANSMITTER = 0x1u << 2;
+    static unsigned int constexpr COMMAND_SET_TRANSMITTER_TRANSFORM = 0x1u << 3;
+    static unsigned int constexpr COMMAND_QUIT = 0x1u << 7;
 
     void initialize_(ExecutionCursor whereInProgram); ///< CUDA and OptiX. Call after setting logging functions.
     void initializeCuda_(ExecutionCursor whereInProgram);
-    void finalizeCuda_(ExecutionCursor whereInProgram);
-
     void initializeOptix_(ExecutionCursor whereInProgram);
+    
+    void finalize_(ExecutionCursor whereInProgram);
+    void finalizeCuda_(ExecutionCursor whereInProgram);
     void finalizeOptix_(ExecutionCursor whereInProgram);
 
     void createOptixDeviceContext_(ExecutionCursor whereInProgram);
@@ -114,17 +114,16 @@ class AssimpOptixRayTracer : public QObject
     void runRayTracing_(ExecutionCursor whereInProgram);
 
     // Multi-threaded communication with parent
-    std::mutex& rayTracingCommandMutex_;
-    std::condition_variable& rayTracingCommandConditionVariable_;
-    std::mutex& rayTracingResultMutex_;
+    std::mutex& commandMutex_;
+    std::condition_variable& commandConditionVariable_;
+    unsigned int command_;
 
     aiScene const *scene_;
     aiMatrix4x4 const *modelToWorldTransform_;
     Transmitter const *transmitter_;
 
-    std::unique_ptr<aiScene> rayTracedPointCloud_;
-
-    command_t command_;
+    std::mutex& resultMutex_;
+    std::unique_ptr<aiScene> resultPointCloud_;
 
     // Callback functors which abstract the output streams for logging.
     std::function<void(std::string const&)> logInfo_;
@@ -132,15 +131,15 @@ class AssimpOptixRayTracer : public QObject
   
     int executionFrame_;
 
-    // Scene data
-    AsyncCudaBuffer modelVertexBufferOnGpu_;
-    AsyncCudaBuffer worldVertexBufferOnGpu_;
-    AsyncCudaBuffer indexBufferOnGpu_;
-    AsyncCudaBuffer rayHitVerticesOnGpu_; // world coords
-
-    // Transmitter data
-    Transmitter transmitter_;
-    aiMatrix4x4 transmitterToWorldTransform_;
+    // Scene data. AsyncCudaBuffer-s need to be initialized on the same (ray-tracing)
+    // thread as all the other logic because they all use the same CUDA stream, and
+    // each CUDA stream must be exclusively accessed by one CPU thread.
+    // So these objects can only be instantiated after construction, once `initialize_()`
+    // is called by the ray-tracing thread.
+    std::unique_ptr<AsyncCudaBuffer> modelVertexBufferOnGpu_;
+    std::unique_ptr<AsyncCudaBuffer> worldVertexBufferOnGpu_;
+    std::unique_ptr<AsyncCudaBuffer> indexBufferOnGpu_;
+    std::unique_ptr<AsyncCudaBuffer> rayHitVerticesOnGpu_; // world coords
 
     // CUDA data
     CUcontext cuCtx_ = 0;
@@ -151,7 +150,7 @@ class AssimpOptixRayTracer : public QObject
 
     // OptiX geometry acceleration structures (mesh + BVH etc.)
     OptixTraversableHandle gasHandle_;
-    AsyncCudaBuffer gasBuild_;
+    std::unique_ptr<AsyncCudaBuffer> gasBuild_;
 
     // OptiX ray-tracing code structures
     OptixModule optixModule_;
