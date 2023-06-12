@@ -32,14 +32,17 @@ AssimpOptixRayTracer::AssimpOptixRayTracer(
     std::mutex& rayTracingCommandMutex,
     std::condition_variable& rayTracingCommandConditionVariable,
     std::mutex& rayTracingResultMutex)
-: rayTracingCommandMutex_(rayTracingCommandMutex),
-  rayTracingCommandConditionVariable_(rayTracingCommandConditionVariable),
-  rayTracingResultMutex_(rayTracingResultMutex)
+: commandMutex_(rayTracingCommandMutex),
+  commandConditionVariable_(rayTracingCommandConditionVariable),
+  resultMutex_(rayTracingResultMutex),
   executionFrame_{ 0 }
 {
     // Capture all OptiX messages via optixLogCallback() above.
     g_theAssimpOptixRayTracer = this;
 }
+
+AssimpOptixRayTracer::~AssimpOptixRayTracer()
+{}
 
 void AssimpOptixRayTracer::eventLoop()
 {
@@ -49,31 +52,32 @@ void AssimpOptixRayTracer::eventLoop()
 
     initialize_(whereInProgram.advance());
 
-    while(!false) {
-        std::unique_lock<std::mutex> lock(rayTracingCommandMutex_);
-        rayTracingCommandConditionVariable_.wait(lock, [](){ command_ != command_t::NONE; });
-    
+    while(true) {
+        std::unique_lock<std::mutex> lock(commandMutex_);
+        commandConditionVariable_.wait(lock, [&](){ return command_ != COMMAND_NONE; });
+        if(command_ == COMMAND_NONE) { continue; } // Guard against spurious wakes.
+
         whereInProgram.frame = std::to_string(executionFrame_++);
         whereInProgram.subFrameLevel = 0;
 
-        if(command_ == command_t::QUIT) { // quit
-            rayTracingCommand_ = 0;
+        if(command_ == COMMAND_QUIT) {
+            command_ = COMMAND_NONE;
             break;
         }
-        if(command_ | command_t::SET_SCENE) {
-            command_ ^= command_t::SET_SCENE;
+        if(command_ | COMMAND_SET_SCENE) {
+            command_ ^= COMMAND_SET_SCENE;
             processScene_(whereInProgram.advance());
         }
-        if(command_ | command_t::SET_SCENE_TRANSFORM) {
-            command_ ^= command_t::SET_SCENE_TRANSFORM;
+        if(command_ | COMMAND_SET_SCENE_TRANSFORM) {
+            command_ ^= COMMAND_SET_SCENE_TRANSFORM;
             processSceneTransform_(whereInProgram.advance());
         }
-        if(command_ | command_t::SET_TRANSMITTER) {
-            command_ ^= command_t::SET_TRANSMITTER;
+        if(command_ | COMMAND_SET_TRANSMITTER) {
+            command_ ^= COMMAND_SET_TRANSMITTER;
             processTransmitter_(whereInProgram.advance());
         }
-        if(command_ | command_t::SET_TRANSMITTER_TRANSFORM) {
-            command_ ^= command_t::SET_TRANSMITTER_TRANSFORM;
+        if(command_ | COMMAND_SET_TRANSMITTER_TRANSFORM) {
+            command_ ^= COMMAND_SET_TRANSMITTER_TRANSFORM;
             // Update to transmitter pose is done in main thread itself, so nothing to do here
             // except to ray-trace later.
         }
@@ -88,23 +92,28 @@ void AssimpOptixRayTracer::eventLoop()
 }
 
 aiScene const* AssimpOptixRayTracer::rayTracingResult() {
-    std::unique_lock<std::mutex> lock(rayTracingResultMutex_);
-    return rayTracedPointCloud_.release();
+    std::unique_lock<std::mutex> lock(resultMutex_);
+    return resultPointCloud_.release();
 }
 
 void AssimpOptixRayTracer::initialize_(ExecutionCursor whereInProgram)
 {
     RaiiScopeLimitsLogger scopeLog(logInfo_, whereInProgram, __func__);
+    
     initializeCuda_(whereInProgram.advance());
+    modelVertexBufferOnGpu_.reset(new AsyncCudaBuffer(cudaStream_));
+    worldVertexBufferOnGpu_.reset(new AsyncCudaBuffer(cudaStream_));
+    indexBufferOnGpu_.reset(new AsyncCudaBuffer(cudaStream_));
+    rayHitVerticesOnGpu_.reset(new AsyncCudaBuffer(cudaStream_));
+    gasBuild_.reset(new AsyncCudaBuffer(cudaStream_));
+
     initializeOptix_(whereInProgram.advance());
 
-    rayTracedPointCloud_ = nullptr;
+    resultPointCloud_.reset();
 }
 
-AssimpOptixRayTracer::~AssimpOptixRayTracer()
+void AssimpOptixRayTracer::finalize_(ExecutionCursor whereInProgram)
 {
-    ExecutionCursor whereInProgram;
-    whereInProgram.frame = std::to_string(executionFrame_++);
     RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
     finalizeOptix_(whereInProgram.advance());
     finalizeCuda_(whereInProgram.advance());
@@ -137,13 +146,7 @@ void AssimpOptixRayTracer::initializeCuda_(ExecutionCursor whereInProgram)
                  + std::string("CUDA device name is ") + cudaDeviceProps.name);
 
         CUDA_CHECK( SetDevice(cudaDevice) );
-
         CUDA_CHECK( StreamCreate(&cudaStream_) );
-        modelVertexBufferOnGpu_.cudaStream = cudaStream_;
-        worldVertexBufferOnGpu_.cudaStream = cudaStream_;
-        indexBufferOnGpu_.cudaStream = cudaStream_;
-        rayHitVerticesOnGpu_.cudaStream = cudaStream_;
-        gasBuild_.cudaStream = cudaStream_;
     }
     catch(std::exception& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -179,12 +182,12 @@ void AssimpOptixRayTracer::processScene_(ExecutionCursor whereInProgram)
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** Scene has no meshes!");
         return;
     }
-    if(scene->mNumMeshes != 1) {
+    if(scene_->mNumMeshes != 1) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** Require scene to have 1 mesh. "
-                "Has " + std::to_string(scene->mNumMeshes));
+                "Has " + std::to_string(scene_->mNumMeshes));
         return;
     }
-    aiMesh const& mesh = *(scene->mMeshes[0]);
+    aiMesh const& mesh = *(scene_->mMeshes[0]);
     if(mesh.mPrimitiveTypes != aiPrimitiveType_TRIANGLE) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** Require mesh to have only triangles."
                 " Not the case");
@@ -194,10 +197,10 @@ void AssimpOptixRayTracer::processScene_(ExecutionCursor whereInProgram)
     // - Vertex and index buffers for geometry - 
 
     try {
-        modelVertexBufferOnGpu_.asyncAllocAndUpload(mesh.mVertices, mesh.mNumVertices);
-        worldVertexBufferOnGpu_.asyncAlloc(mesh.mNumVertices * sizeof(aiVector3D));
-        worldVertexBufferOnGpu_.numElements = mesh.mNumVertices;
-        worldVertexBufferOnGpu_.sizeOfElement = sizeof(aiVector3D);
+        modelVertexBufferOnGpu_->asyncAllocAndUpload(mesh.mVertices, mesh.mNumVertices);
+        worldVertexBufferOnGpu_->asyncAlloc(mesh.mNumVertices * sizeof(aiVector3D));
+        worldVertexBufferOnGpu_->numElements = mesh.mNumVertices;
+        worldVertexBufferOnGpu_->sizeOfElement = sizeof(aiVector3D);
 
         std::vector<int16_t> indexBuffer(mesh.mNumFaces * 3);
         int indexCounter = 0;
@@ -211,7 +214,7 @@ void AssimpOptixRayTracer::processScene_(ExecutionCursor whereInProgram)
             assert(face.mIndices[2] < (1u << 16));
             indexBuffer[indexCounter++] = (uint16_t) face.mIndices[2];
         }
-        indexBufferOnGpu_.asyncAllocAndUpload(indexBuffer);
+        indexBufferOnGpu_->asyncAllocAndUpload(indexBuffer);
     }
     catch(std::exception& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
@@ -248,11 +251,11 @@ void AssimpOptixRayTracer::processSceneTransform_(ExecutionCursor whereInProgram
         // 8 block with 32 threads each
         int const kNumThreadsPerBlock = 32;
         // TODO: large meshes can exceed CUDA limits
-        int const kNumBlocks = (modelVertexBufferOnGpu_.numElements + kNumThreadsPerBlock-1) / kNumThreadsPerBlock;
+        int const kNumBlocks = (modelVertexBufferOnGpu_->numElements + kNumThreadsPerBlock-1) / kNumThreadsPerBlock;
         transformVertexBufferOnGpu<<<kNumBlocks, kNumThreadsPerBlock, 0, cudaStream_>>>(
-            worldVertexBufferOnGpu_.d_pointer(),
-            modelVertexBufferOnGpu_.d_pointer(),
-            modelVertexBufferOnGpu_.numElements,
+            worldVertexBufferOnGpu_->d_pointer(),
+            modelVertexBufferOnGpu_->d_pointer(),
+            modelVertexBufferOnGpu_->numElements,
             modelToWorldTransformOnGpu.d_pointer()
         );
         CUDA_CHECK( GetLastError() );
@@ -272,13 +275,13 @@ void AssimpOptixRayTracer::processTransmitter_(ExecutionCursor whereInProgram) {
     try {
         // In worst-case all rays will hit geometry.
         int32_t const numRays = transmitter_->numRays_x * transmitter_->numRays_y;
-        rayHitVerticesOnGpu_.asyncFree();
-        rayHitVerticesOnGpu_.asyncAlloc(numRays * sizeof(float3));
+        rayHitVerticesOnGpu_->asyncFree();
+        rayHitVerticesOnGpu_->asyncAlloc(numRays * sizeof(float3));
         // The following metadata needs to be ready before we 'download' results from GPU to CPU.
-        rayHitVerticesOnGpu_.sizeOfElement = sizeof(float3);
+        rayHitVerticesOnGpu_->sizeOfElement = sizeof(float3);
         // Haven't ray-traced yet.
         // Will set this to the value of atomic counter (incremented by ray-collisions), post-ray-tracing.
-        rayHitVerticesOnGpu_.numElements = 0;
+        rayHitVerticesOnGpu_->numElements = 0;
 
         // The pose part of transmitter is handled by setTransmitterTransform() and processTransmitterTransform_().
         // Other data within Transmitter are sent as part of (optix)Launch(Params);
@@ -294,10 +297,11 @@ void AssimpOptixRayTracer::runRayTracing_(ExecutionCursor whereInProgram)
     try {
         OptixLaunchParams launchParams{};
         {
-            launchParams.pointCloud = (void*) rayHitVerticesOnGpu_.d_pointer();
+            launchParams.pointCloud = (void*) rayHitVerticesOnGpu_->d_pointer();
             launchParams.gasHandle = gasHandle_;
-            launchParams.transmitter = transmitter_;
             launchParams.gpuAtomicNumHits = 0;
+            std::unique_lock<std::mutex> lock(commandMutex_);
+            launchParams.transmitter = *transmitter_;
         }
         AsyncCudaBuffer launchParamsOnGpu{cudaStream_};
         launchParamsOnGpu.asyncAllocAndUpload(&launchParams, 1);
@@ -311,16 +315,15 @@ void AssimpOptixRayTracer::runRayTracing_(ExecutionCursor whereInProgram)
                         launchParams.transmitter.numRays_y,
                         1)
         );
-        CUDA_CHECK( StreamSynchronize(cudaStream_) );
         launchParamsOnGpu.asyncDownload(&launchParams, 1);
         launchParamsOnGpu.sync(); // Ensure download completes before accessing results.
-        rayHitVerticesOnGpu_.numElements = launchParams.gpuAtomicNumHits;
+        rayHitVerticesOnGpu_->numElements = launchParams.gpuAtomicNumHits;
         
         aiMesh *const pointCloudMesh = new aiMesh;
         pointCloudMesh->mNumVertices = launchParams.gpuAtomicNumHits;
         pointCloudMesh->mVertices = new aiVector3D[launchParams.gpuAtomicNumHits];
-        rayHitVerticesOnGpu_.asyncDownload(pointCloudMesh->mVertices, pointCloudMesh->mNumVertices);
-        rayHitVerticesOnGpu_.sync(); // Ensure download completes before accessing results.
+        rayHitVerticesOnGpu_->asyncDownload(pointCloudMesh->mVertices, pointCloudMesh->mNumVertices);
+        rayHitVerticesOnGpu_->sync(); // Ensure download completes before accessing results.
 
         // Scenes must have a root node which indexes into the master mesh-array within the parent scene.
         aiNode *const pointCloudNode = new aiNode;
@@ -331,12 +334,12 @@ void AssimpOptixRayTracer::runRayTracing_(ExecutionCursor whereInProgram)
         pointCloudNode->mNumChildren = 0;
         pointCloudNode->mChildren = nullptr;
 
-        rayTracedPointCloud_.reset(new aiScene);
+        resultPointCloud_.reset(new aiScene);
         using aiMeshPtr_t = aiMesh*;
-        rayTracedPointCloud_->mMeshes = new aiMeshPtr_t[1];
-        rayTracedPointCloud_->mMeshes[0] = pointCloudMesh;
-        rayTracedPointCloud_->mNumMeshes = 1;
-        rayTracedPointCloud_->mRootNode = pointCloudNode;
+        resultPointCloud_->mMeshes = new aiMeshPtr_t[1];
+        resultPointCloud_->mMeshes[0] = pointCloudMesh;
+        resultPointCloud_->mNumMeshes = 1;
+        resultPointCloud_->mRootNode = pointCloudNode;
 
         emit rayTracingComplete();
     }
@@ -386,14 +389,14 @@ void AssimpOptixRayTracer::buildOptixAccelerationStructures_(ExecutionCursor whe
 
 		// https://raytracing-docs.nvidia.com/optix7/api/struct_optix_build_input_triangle_array.html
         OptixBuildInputTriangleArray& triangleArray = optixBuildInput.triangleArray;
-		triangleArray.vertexBuffers = (CUdeviceptr*) &(worldVertexBufferOnGpu_.d_ptr);
-		triangleArray.numVertices = (unsigned int) worldVertexBufferOnGpu_.numElements;
+		triangleArray.vertexBuffers = (CUdeviceptr*) &(worldVertexBufferOnGpu_->d_ptr);
+		triangleArray.numVertices = (unsigned int) worldVertexBufferOnGpu_->numElements;
 		// https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#ga55c6d96161ef202d48023a8a1d126102
 		triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
         triangleArray.vertexStrideInBytes = 0; // tightly-packed
 
-		triangleArray.indexBuffer = (CUdeviceptr) indexBufferOnGpu_.d_pointer();
-		triangleArray.numIndexTriplets = (unsigned int) indexBufferOnGpu_.numElements / 3; // triplets, remember?
+		triangleArray.indexBuffer = (CUdeviceptr) indexBufferOnGpu_->d_pointer();
+		triangleArray.numIndexTriplets = (unsigned int) indexBufferOnGpu_->numElements / 3; // triplets, remember?
 		// https://raytracing-docs.nvidia.com/optix7/api/group__optix__types.html#gaa98b8fb6bf2d2455c310125f3fab74e6
 		triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_SHORT3;
 		triangleArray.indexStrideInBytes = 0; // tightly-packed
@@ -414,7 +417,7 @@ void AssimpOptixRayTracer::buildOptixAccelerationStructures_(ExecutionCursor whe
     assert(optixAccelBufferSizes.tempUpdateSizeInBytes == 0);
 
     // Allocate buffers for the build
-    gasBuild_.asyncResize(optixAccelBufferSizes.outputSizeInBytes);
+    gasBuild_->asyncResize(optixAccelBufferSizes.outputSizeInBytes);
 
     AsyncCudaBuffer gasBuildTemp{cudaStream_};
     gasBuildTemp.asyncResize(optixAccelBufferSizes.tempSizeInBytes);
@@ -425,7 +428,7 @@ void AssimpOptixRayTracer::buildOptixAccelerationStructures_(ExecutionCursor whe
                         &optixAccelBuildOptions,
                         &optixBuildInput, 1,
                         (CUdeviceptr) gasBuildTemp.d_pointer(), gasBuildTemp.sizeInBytes,
-                        (CUdeviceptr) gasBuild_.d_pointer(), gasBuild_.sizeInBytes,
+                        (CUdeviceptr) gasBuild_->d_pointer(), gasBuild_->sizeInBytes,
                         &gasHandle_,
                         nullptr, 0 // emitted properties
                         );

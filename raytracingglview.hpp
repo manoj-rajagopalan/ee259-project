@@ -14,7 +14,7 @@ class CRayTracingGLView : public CGLView
   public:
     CRayTracingGLView(QWidget *parent, std::mutex& sharedSceneMutex)
     : CGLView(parent),
-      sharedSceneMutex_(mSharedSceneMutex)
+      sharedSceneMutex_(sharedSceneMutex)
     {}
 
   private:

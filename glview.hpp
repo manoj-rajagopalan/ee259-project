@@ -456,7 +456,4 @@ signals:
 	/// \param [out] pName - name of the light source.
 	void SceneObject_LightSource(const QString& pName);
 
-protected:
-	aiScene* scene() { return mScene; }
-
 };// class CGLView

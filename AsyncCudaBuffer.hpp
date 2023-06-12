@@ -10,7 +10,7 @@ namespace manojr {
 
   struct AsyncCudaBuffer {
 
-    AsyncCudaBuffer() : cudaStream{0} {}
+    AsyncCudaBuffer() = delete;
 
     explicit AsyncCudaBuffer(cudaStream_t cudaStream) {
       this->cudaStream = cudaStream;
