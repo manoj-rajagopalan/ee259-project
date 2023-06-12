@@ -130,6 +130,9 @@ void AssimpOptixRayTracer::registerLoggingFunctions(
 
 void AssimpOptixRayTracer::initializeCuda_(ExecutionCursor whereInProgram)
 {
+    cudaFree(0);
+	cuCtx_ = 0;
+
     RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
     try {
         int cudaDeviceCount = 0;
@@ -518,7 +521,7 @@ OptixPipelineLinkOptions AssimpOptixRayTracer::makeOptixPipelineLinkOptions_()
 {
     // https://raytracing-docs.nvidia.com/optix7/api/struct_optix_pipeline_link_options.html
     OptixPipelineLinkOptions optixPipelineLinkOptions;
-    optixPipelineLinkOptions.maxTraceDepth = 5;
+    optixPipelineLinkOptions.maxTraceDepth = 2;
     return optixPipelineLinkOptions;
 }
 
@@ -800,9 +803,6 @@ void AssimpOptixRayTracer::makeOptixShaderBindingTable_(ExecutionCursor whereInP
 void AssimpOptixRayTracer::initializeOptix_(ExecutionCursor whereInProgram)
 {
     RaiiScopeLimitsLogger raiiScopeLogger(logInfo_, whereInProgram, __func__);
-
-	cudaFree(0);
-	cuCtx_ = 0;
     ExecutionCursor whereInSubProgram = whereInProgram.nextLevel();
 	try {
 		OPTIX_CHECK(optixInit());
