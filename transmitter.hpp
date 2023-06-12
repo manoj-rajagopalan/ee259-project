@@ -2,8 +2,6 @@
 
 #include <cstdint>
 
-//- #include "float3.hpp"
-
 namespace manojr
 {
 

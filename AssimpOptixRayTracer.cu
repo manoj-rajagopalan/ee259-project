@@ -31,11 +31,10 @@ namespace manojr
 AssimpOptixRayTracer::AssimpOptixRayTracer(
     std::mutex& rayTracingCommandMutex,
     std::condition_variable& rayTracingCommandConditionVariable,
-    int& rayTracingCommand
-)
+    std::mutex& rayTracingResultMutex)
 : rayTracingCommandMutex_(rayTracingCommandMutex),
   rayTracingCommandConditionVariable_(rayTracingCommandConditionVariable),
-  rayTracingCommand_(rayTracingCommand),
+  rayTracingResultMutex_(rayTracingResultMutex)
   executionFrame_{ 0 }
 {
     // Capture all OptiX messages via optixLogCallback() above.
@@ -44,47 +43,69 @@ AssimpOptixRayTracer::AssimpOptixRayTracer(
 
 void AssimpOptixRayTracer::eventLoop()
 {
-    initialize();
-    bool quit = false;
-    while(!false) {
-        std::unique_lock<std::mutex> lock(rayTracingCommandMutex_);
-        rayTracingCommandConditionVariable_.wait(lock, [](){ rayTracingCommand_ != 0; });
-        if(rayTracingCommand_ < 0) { // quit
-            rayTracingCommand_ = 0;
-            quit = true;
-        }
-        else if(rayTracingCommand_ == 1) { // ray-trace
-            rayTracingCommand_ = 0;
-            lock.unlock();
-            runRayTracing(); // TODO capture result
-        }
-        else if(rayTracingCommand_ == 2) { // new scene
-            setScene(scene);
-            aiMatrix4x4 identityTransform{};
-            setSceneTransform(identityTransform);
-            rayTracingCommand_ = 0;
-            lock.unlock();
-            runRayTracing(); // TODO capture result
-        }
-    }
-    finalize();
-}
-
-void AssimpOptixRayTracer::initialize()
-{
     ExecutionCursor whereInProgram;
     whereInProgram.frame = std::to_string(executionFrame_++);
-    RaiiScopeLimitsLogger scopeLog(logInfo_, whereInProgram, __func__);
+    RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
 
+    initialize_(whereInProgram.advance());
+
+    while(!false) {
+        std::unique_lock<std::mutex> lock(rayTracingCommandMutex_);
+        rayTracingCommandConditionVariable_.wait(lock, [](){ command_ != command_t::NONE; });
+    
+        whereInProgram.frame = std::to_string(executionFrame_++);
+        whereInProgram.subFrameLevel = 0;
+
+        if(command_ == command_t::QUIT) { // quit
+            rayTracingCommand_ = 0;
+            break;
+        }
+        if(command_ | command_t::SET_SCENE) {
+            command_ ^= command_t::SET_SCENE;
+            processScene_(whereInProgram.advance());
+        }
+        if(command_ | command_t::SET_SCENE_TRANSFORM) {
+            command_ ^= command_t::SET_SCENE_TRANSFORM;
+            processSceneTransform_(whereInProgram.advance());
+        }
+        if(command_ | command_t::SET_TRANSMITTER) {
+            command_ ^= command_t::SET_TRANSMITTER;
+            processTransmitter_(whereInProgram.advance());
+        }
+        if(command_ | command_t::SET_TRANSMITTER_TRANSFORM) {
+            command_ ^= command_t::SET_TRANSMITTER_TRANSFORM;
+            // Update to transmitter pose is done in main thread itself, so nothing to do here
+            // except to ray-trace later.
+        }
+
+        lock.unlock();
+        runRayTracing_(whereInProgram.advance()); // emits rayTracingComplete()
+    }
+
+    whereInProgram.frame = std::to_string(executionFrame_++);
+    whereInProgram.subFrameLevel = 0;
+    finalize_(whereInProgram.advance());
+}
+
+aiScene const* AssimpOptixRayTracer::rayTracingResult() {
+    std::unique_lock<std::mutex> lock(rayTracingResultMutex_);
+    return rayTracedPointCloud_.release();
+}
+
+void AssimpOptixRayTracer::initialize_(ExecutionCursor whereInProgram)
+{
+    RaiiScopeLimitsLogger scopeLog(logInfo_, whereInProgram, __func__);
     initializeCuda_(whereInProgram.advance());
     initializeOptix_(whereInProgram.advance());
+
+    rayTracedPointCloud_ = nullptr;
 }
 
 AssimpOptixRayTracer::~AssimpOptixRayTracer()
 {
     ExecutionCursor whereInProgram;
     whereInProgram.frame = std::to_string(executionFrame_++);
-    RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, "AssimpOptixRayTracer DTOR");
+    RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
     finalizeOptix_(whereInProgram.advance());
     finalizeCuda_(whereInProgram.advance());
 }
@@ -100,6 +121,7 @@ void AssimpOptixRayTracer::registerLoggingFunctions(
 
 void AssimpOptixRayTracer::initializeCuda_(ExecutionCursor whereInProgram)
 {
+    RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
     try {
         int cudaDeviceCount = 0;
         CUDA_CHECK( GetDeviceCount(&cudaDeviceCount) );
@@ -130,6 +152,7 @@ void AssimpOptixRayTracer::initializeCuda_(ExecutionCursor whereInProgram)
 
 void AssimpOptixRayTracer::finalizeCuda_(ExecutionCursor whereInProgram)
 {
+    RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
     try {
         CUDA_CHECK( StreamDestroy(cudaStream_) );
     }
@@ -148,22 +171,20 @@ void AssimpOptixRayTracer::logOptixMessage(unsigned int level, const char *tag, 
 
 
 /// @brief Push geometry into GPU and reserve memory for results.
-void AssimpOptixRayTracer::setScene(aiScene const& scene)
+void AssimpOptixRayTracer::processScene_(ExecutionCursor whereInProgram)
 {
-    ExecutionCursor whereInProgram;
-    whereInProgram.frame = std::to_string(executionFrame_++);
     RaiiScopeLimitsLogger raiiScopeLogger(logInfo_, whereInProgram, __func__);
 
-    if(!scene.HasMeshes()) {
+    if(!scene_->HasMeshes()) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** Scene has no meshes!");
         return;
     }
-    if(scene.mNumMeshes != 1) {
+    if(scene->mNumMeshes != 1) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** Require scene to have 1 mesh. "
-                "Has " + std::to_string(scene.mNumMeshes));
+                "Has " + std::to_string(scene->mNumMeshes));
         return;
     }
-    aiMesh const& mesh = *scene.mMeshes[0];
+    aiMesh const& mesh = *(scene->mMeshes[0]);
     if(mesh.mPrimitiveTypes != aiPrimitiveType_TRIANGLE) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** Require mesh to have only triangles."
                 " Not the case");
@@ -218,15 +239,12 @@ void transformVertexBufferOnGpu(void *worldVertices,
     w.z = inner_prod(M[2], v);
 }
 
-void AssimpOptixRayTracer::setSceneTransform(aiMatrix4x4 const& modelToWorldTransform)
+void AssimpOptixRayTracer::processSceneTransform_(ExecutionCursor whereInProgram)
 {
-    ExecutionCursor whereInProgram;
-    whereInProgram.frame = std::to_string(executionFrame_++);
     RaiiScopeLimitsLogger raiiScopeLogger(logInfo_, whereInProgram, __func__);
-
     try {
         AsyncCudaBuffer modelToWorldTransformOnGpu{cudaStream_};
-        modelToWorldTransformOnGpu.asyncAllocAndUpload((float const*) &modelToWorldTransform, 12);
+        modelToWorldTransformOnGpu.asyncAllocAndUpload((float const*) modelToWorldTransform_, 12);
         // 8 block with 32 threads each
         int const kNumThreadsPerBlock = 32;
         // TODO: large meshes can exceed CUDA limits
@@ -248,51 +266,31 @@ void AssimpOptixRayTracer::setSceneTransform(aiMatrix4x4 const& modelToWorldTran
     }
 }
 
-void AssimpOptixRayTracer::setTransmitter(manojr::Transmitter const& transmitter) {
-    transmitter_ = transmitter;
+/// Allocate on-GPU memory for ray-tracing results (collision points in world space).
+void AssimpOptixRayTracer::processTransmitter_(ExecutionCursor whereInProgram) {
+    RaiiScopeLimitsLogger scopeLogger(logInfo_, whereInProgram, __func__);
+    try {
+        // In worst-case all rays will hit geometry.
+        int32_t const numRays = transmitter_->numRays_x * transmitter_->numRays_y;
+        rayHitVerticesOnGpu_.asyncFree();
+        rayHitVerticesOnGpu_.asyncAlloc(numRays * sizeof(float3));
+        // The following metadata needs to be ready before we 'download' results from GPU to CPU.
+        rayHitVerticesOnGpu_.sizeOfElement = sizeof(float3);
+        // Haven't ray-traced yet.
+        // Will set this to the value of atomic counter (incremented by ray-collisions), post-ray-tracing.
+        rayHitVerticesOnGpu_.numElements = 0;
 
-    // Allocate on-GPU memory for ray-tracing results (collision points in world space).
-    // In worst-case all rays will hit geometry.
-    int32_t const numRays = transmitter_.numRays_x * transmitter_.numRays_y;
-    rayHitVerticesOnGpu_.asyncFree();
-    rayHitVerticesOnGpu_.asyncAlloc(numRays * sizeof(float3));
-    // The following metadata needs to be ready before we 'download' results from GPU to CPU.
-    rayHitVerticesOnGpu_.sizeOfElement = sizeof(float3);
-    // Haven't ray-traced yet.
-    // Will set this to the value of atomic counter (incremented by ray-collisions), post-ray-tracing.
-    rayHitVerticesOnGpu_.numElements = 0;
+        // The pose part of transmitter is handled by setTransmitterTransform() and processTransmitterTransform_().
+        // Other data within Transmitter are sent as part of (optix)Launch(Params);
+    }
+    catch(std::exception const& e) {
+        logInfo_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
+    }
 }
 
-void AssimpOptixRayTracer::setTransmitterTransform(aiMatrix4x4 const& transmitterToWorldTransform /* 3x3 rotation matrix only! */)
+void AssimpOptixRayTracer::runRayTracing_(ExecutionCursor whereInProgram)
 {
-    // Though the name mentions 'transform', this really is only a 3x3 rotation.
-    // The AssImp Qt Viewer library which provides our GLView implementation is sloppy with
-    // using 4x4 matrices to maintain 3x3 rotation, presumably because AssImp library itself
-    // has no notion of 3x3 matrices.
-
-    // The unit-vectors for the transmitter in world-space are simply the columns of the
-    // transmitter-to-world rotation matrix.
-
-	transmitter_.xUnitVector.x = transmitterToWorldTransform[0][0];
-	transmitter_.xUnitVector.y = transmitterToWorldTransform[1][0];
-	transmitter_.xUnitVector.z = transmitterToWorldTransform[2][0];
-	
-	transmitter_.yUnitVector.x = transmitterToWorldTransform[0][1];
-	transmitter_.yUnitVector.y = transmitterToWorldTransform[1][1];
-	transmitter_.yUnitVector.z = transmitterToWorldTransform[2][1];
-	
-	transmitter_.zUnitVector.x = transmitterToWorldTransform[0][2];
-	transmitter_.zUnitVector.y = transmitterToWorldTransform[1][2];
-	transmitter_.zUnitVector.z = transmitterToWorldTransform[2][2];
-}
-
-aiScene* AssimpOptixRayTracer::runRayTracing()
-{
-    ExecutionCursor whereInProgram;
-    whereInProgram.frame = std::to_string(executionFrame_++);
     RaiiScopeLimitsLogger raiiScopeLogger(logInfo_, whereInProgram, __func__);
-
-    aiScene *const pointCloudScene = new aiScene;
     try {
         OptixLaunchParams launchParams{};
         {
@@ -324,11 +322,6 @@ aiScene* AssimpOptixRayTracer::runRayTracing()
         rayHitVerticesOnGpu_.asyncDownload(pointCloudMesh->mVertices, pointCloudMesh->mNumVertices);
         rayHitVerticesOnGpu_.sync(); // Ensure download completes before accessing results.
 
-        using aiMeshPtr_t = aiMesh*;
-        pointCloudScene->mMeshes = new aiMeshPtr_t[1];
-        pointCloudScene->mMeshes[0] = pointCloudMesh;
-        pointCloudScene->mNumMeshes = 1;
-
         // Scenes must have a root node which indexes into the master mesh-array within the parent scene.
         aiNode *const pointCloudNode = new aiNode;
         pointCloudNode->mName = "point-cloud";
@@ -337,13 +330,19 @@ aiScene* AssimpOptixRayTracer::runRayTracing()
         pointCloudNode->mMeshes[0] = 0; // First entry in the array of meshes in the scene.
         pointCloudNode->mNumChildren = 0;
         pointCloudNode->mChildren = nullptr;
-        pointCloudScene->mRootNode = pointCloudNode;
+
+        rayTracedPointCloud_.reset(new aiScene);
+        using aiMeshPtr_t = aiMesh*;
+        rayTracedPointCloud_->mMeshes = new aiMeshPtr_t[1];
+        rayTracedPointCloud_->mMeshes[0] = pointCloudMesh;
+        rayTracedPointCloud_->mNumMeshes = 1;
+        rayTracedPointCloud_->mRootNode = pointCloudNode;
+
+        emit rayTracingComplete();
     }
     catch(std::exception const& e) {
         logError_('[' + whereInProgram.toString() + "] ***ERROR*** " + e.what());
     }
-
-    return pointCloudScene;
 }
 
 void AssimpOptixRayTracer::createOptixDeviceContext_(ExecutionCursor whereInProgram)
