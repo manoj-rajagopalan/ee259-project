@@ -358,6 +358,9 @@ public:
 	/// Enable drawing scene bounding box.
 	/// \param [in] pEnable - if true then bbox will be drawing, if false - will not be drawing.
 	void Enable_SceneBBox(const bool pEnable) { mScene_DrawBBox = pEnable; }
+ 
+	SBBox const& SceneBBox() const { return mScene_BBox; }
+	aiVector3D const& SceneCenter() const { return mScene_Center; }
 
 	/// \fn void Enable_Textures(const bool pEnable)
 	/// Control textures drawing.

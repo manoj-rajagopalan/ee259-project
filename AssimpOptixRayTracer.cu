@@ -92,7 +92,7 @@ void AssimpOptixRayTracer::eventLoop()
 }
 
 aiScene const* AssimpOptixRayTracer::rayTracingResult() {
-    std::unique_lock<std::mutex> lock(resultMutex_);
+    // std::unique_lock<std::mutex> lock(resultMutex_);
     return resultPointCloud_.release();
 }
 
@@ -385,6 +385,7 @@ void AssimpOptixRayTracer::runRayTracing_(ExecutionCursor whereInProgram)
         resultPointCloud_->mMeshes[0] = pointCloudMesh;
         resultPointCloud_->mNumMeshes = 1;
         resultPointCloud_->mRootNode = pointCloudNode;
+        resultLock.unlock();
 
         emit rayTracingComplete(); // Signal main thread to harvest result using rayTracingResult()
     }
