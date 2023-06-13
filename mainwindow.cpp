@@ -56,6 +56,34 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 using namespace Assimp;
 
+inline
+float3 subtract(float3 const& a, aiVector3D const& b)
+{
+	return make_float3(a.x - b[0], a.y - b[1], a.z - b[2]);
+}
+
+inline
+float3 cross(float3 const& a, float3 const& b)
+{
+	float3 c;
+	c.x = a.y*b.z - a.z*b.y;
+	c.y = a.z*b.x - a.x*b.z;
+	c.z = a.x*b.y - b.x*a.y;
+	return c;
+}
+
+inline
+float3 normalize(float3 const& v)
+{
+	float const v_len = std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
+	if(v_len == 0.0f) {
+		return v;
+	}
+	else {
+		return make_float3(v.x/v_len, v.y/v_len, v.z/v_len);
+	}
+}
+
 void MainWindow::ImportFile(const QString &pFileName) {
     QTime time_begin = QTime::currentTime();
 
@@ -130,7 +158,14 @@ void MainWindow::ImportFile(const QString &pFileName) {
 		transmitter_.position.x = cameraPosition[0];
 		transmitter_.position.y = cameraPosition[1];
 		transmitter_.position.z = cameraPosition[2];
-		UpdateTransmitterPose_(transmitter_, cameraToWorld);
+
+		// UpdateTransmitterPose_(transmitter_, cameraToWorld);
+		aiVector3D const& sceneCenter = mGLView->SceneCenter();
+		transmitter_.zUnitVector = normalize(subtract(transmitter_.position, sceneCenter));
+		transmitter_.xUnitVector = normalize(cross(make_float3(0,1,0), transmitter_.zUnitVector));
+		transmitter_.yUnitVector = normalize(cross(transmitter_.zUnitVector,
+		                                           transmitter_.xUnitVector));
+
 		transmitter_.width = 1.0f;
 		transmitter_.height = 1.0f;
 		transmitter_.focalLength = 1.0f;
@@ -263,6 +298,7 @@ void MainWindow::renderRayTracedPointCloud()
 	aiScene const *const rayTracedPointCloud = mAssimpOptixRayTracer.rayTracingResult(); // Ownership transfer
 	mRayTracingResult.reset(rayTracedPointCloud); // Ownership transfer
 	mGLView_rayTraced->SetScene(rayTracedPointCloud, QString());
+	lock.unlock();
 #if ASSIMP_QT4_VIEWER
 	mGLView_rayTraced->updateGL();
 #else
@@ -363,7 +399,6 @@ MainWindow::MainWindow(QWidget *parent)
 
 	ui->setupUi(this);
 	QGridLayout *const gridLayout = new QGridLayout(this);
-	this->setLayout(gridLayout);
 
 	// Create OpenGL widget
 	mGLView = new CGLView(this);
