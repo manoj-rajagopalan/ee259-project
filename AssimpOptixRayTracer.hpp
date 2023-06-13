@@ -141,10 +141,11 @@ class AssimpOptixRayTracer : public QObject
     std::unique_ptr<AsyncCudaBuffer> worldVertexBufferOnGpu_;
     std::unique_ptr<AsyncCudaBuffer> indexBufferOnGpu_;
     std::unique_ptr<AsyncCudaBuffer> rayHitVerticesOnGpu_; // world coords
+    std::unique_ptr<AsyncCudaBuffer> numRayHitVerticesOnGpu_; // 32b integer
 
     // CUDA data
     CUcontext cuCtx_ = 0;
-    cudaStream_t cudaStream_;
+    cudaStream_t cudaStream_ = 0;
 
     // OptiX stuff
     OptixDeviceContext optixDeviceContext_ = nullptr;
