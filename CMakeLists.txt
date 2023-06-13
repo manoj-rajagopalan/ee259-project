@@ -39,16 +39,20 @@ INCLUDE_DIRECTORIES(${CMAKE_SOURCE_DIR}/3rdparty)
 add_executable(ee259 ${ee259_SRCS} ${ee259_UI_SRCS} ${ee259_MOC_SRCS})
 
 # https://cmake.org/cmake/help/latest/manual/cmake-qt.7.html#automoc
-set_target_properties(ee259 PROPERTIES AUTOMOC ON)
+set_target_properties(ee259
+                      PROPERTIES AUTOMOC ON)
 
 # https://cmake.org/cmake/help/latest/command/qt_wrap_ui.html?highlight=qt5_wrap_ui
 # https://cmake.org/cmake/help/latest/prop_tgt/AUTOUIC.html#prop_tgt:AUTOUIC
-set_target_properties(ee259 PROPERTIES AUTOUIC ON)
+set_target_properties(ee259
+                      PROPERTIES AUTOUIC ON)
 
-set_target_properties(ee259 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+set_target_properties(ee259
+                      PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 # https://cmake.org/cmake/help/v3.22/prop_tgt/CUDA_ARCHITECTURES.html
-set_target_properties(ee259 PROPERTIES CUDA_ARCHITECTURES "75")
+set_target_properties(ee259
+                      PROPERTIES CUDA_ARCHITECTURES "75")
 
 target_link_libraries(ee259
                       Qt5::Gui
@@ -56,7 +60,27 @@ target_link_libraries(ee259
                       Qt5::OpenGL
                       ${OPENGL_LIBRARIES}
                       assimp
-                      cudart)
+                      cudart
+                      cuda)
 
 # Refs:
 # https://developer.nvidia.com/blog/building-cuda-applications-cmake/
+
+
+add_executable(test_AssimpOptixRayTracer
+               test_AssimpOptixRayTracer.cpp
+               AssimpOptixRayTracer.hpp
+               AssimpOptixRayTracer.cu
+               transmitter.hpp
+               ExecutionCursor.hpp
+               LaunchParams.hpp
+               AsyncCudaBuffer.hpp)
+target_link_libraries(test_AssimpOptixRayTracer
+                      Qt5::Core
+                      assimp
+                      cudart
+                      cuda)
+set_target_properties(test_AssimpOptixRayTracer
+                      PROPERTIES AUTOMOC ON)
+set_target_properties(test_AssimpOptixRayTracer
+                      PROPERTIES CUDA_ARCHITECTURES "75")
