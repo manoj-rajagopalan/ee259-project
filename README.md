@@ -10,6 +10,7 @@ Most of my contributions are under the namespace `manojr` or have been marked in
 
 The main files containing my contribution are:
 - `AssimpOptixRayTracer.`{`hpp`,`cu`}
+- `ee259.cu`
 - `transmitter.hpp`
 - `LauncherParams.hpp`
 - `AsyncCudaBuffer.hpp` (heavily modified from the original)
