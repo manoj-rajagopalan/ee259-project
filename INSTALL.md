@@ -19,7 +19,7 @@
 - Run `make` - this will create an executable named `ee259`.
    Do not run this yet.
 - Separately build PTX for ray-tracing code for dynamic loading:
-  `nvcc ee259.cu -g --ptx --ccbin g++-10 -I .. -I <path to OptiX include/ dir>`
+  `nvcc ee259.cu -g --ptx -ccbin g++-10 -rdc=true -I .. -I <path to OptiX include/ dir>`
   This creates `ee295.ptx` in the `_build/` dir.
   This will be dynamically loaded at program runtime.
 
@@ -30,5 +30,6 @@
 # Notes
 - `nvcc` v11 has a problem when running with `gcc` v11: compile failures are reported inside `std::functional` (some difficulty in unpacking template parameters with `...` (in the C++11+ sense)). Notes on the internet say switching to `gcc` v10 helps but it is NOT sufficient to simply `apt install g++-10`: `nvcc` does NOT pick it up automatically. The `g++-10` value of the `-ccbin` argument actually indicates the `g++10` executable (in `PATH` due to `/usr/bin/`) that `nvcc` must use. This removes the problematic version of the `<functional>` header.
 - Including `ee259.cu` into CMakeLists.txt will result in `nvcc` linker failure to resolve `optix...` symbols. Looks like this resolution is dynamically, by the OptiX runtime, at the time the module is built. Hence we build it separately and present it as an asset to the running program.
+- The `rdc=true` in the PTX-generation command-line above is to enable relocatable code. Without this, `nvcc` emits a warning that `extern declaration of 'LaunchParams' is considered static`. Not sure what this means but forums said this warning could be eliminated this way.
 
 
